@@ -194,7 +194,6 @@ r = 3 { true }`)
 		"data.a.b.c.q",
 		"data.a.b.d.r",
 		"data.repl.s",
-		"data.repl.version",
 	}
 
 	sort.Strings(result)
@@ -314,6 +313,48 @@ func TestHelp(t *testing.T) {
 	}
 }
 
+func TestShowDebug(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.New()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "show debug")
+
+	var result replDebugState
+
+	if err := util.Unmarshal(buffer.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	var exp replDebugState
+	exp.Explain = explainOff
+
+	if !reflect.DeepEqual(result, exp) {
+		t.Fatalf("Expected %+v but got %+v", exp, result)
+	}
+
+	buffer.Reset()
+
+	repl.OneShot(ctx, "trace")
+	repl.OneShot(ctx, "metrics")
+	repl.OneShot(ctx, "instrument")
+	repl.OneShot(ctx, "profile")
+	repl.OneShot(ctx, "show debug")
+
+	exp.Explain = explainFull
+	exp.Metrics = true
+	exp.Instrument = true
+	exp.Profile = true
+
+	if err := util.Unmarshal(buffer.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(result, exp) {
+		t.Fatalf("Expected %+v but got %+v", exp, result)
+	}
+}
+
 func TestShow(t *testing.T) {
 	ctx := context.Background()
 	store := inmem.New()
@@ -322,7 +363,7 @@ func TestShow(t *testing.T) {
 
 	repl.OneShot(ctx, `package repl_test`)
 	repl.OneShot(ctx, "show")
-	assertREPLText(t, buffer, "package repl_test\n\n")
+	assertREPLText(t, buffer, "package repl_test\n")
 	buffer.Reset()
 
 	repl.OneShot(ctx, "import input.xyz")
@@ -330,7 +371,7 @@ func TestShow(t *testing.T) {
 
 	expected := `package repl_test
 
-import input.xyz` + "\n\n"
+import input.xyz` + "\n"
 	assertREPLText(t, buffer, expected)
 	buffer.Reset()
 
@@ -340,7 +381,7 @@ import input.xyz` + "\n\n"
 	expected = `package repl_test
 
 import data.foo as bar
-import input.xyz` + "\n\n"
+import input.xyz` + "\n"
 	assertREPLText(t, buffer, expected)
 	buffer.Reset()
 
@@ -357,14 +398,14 @@ import input.xyz
 
 p[1]
 
-p[2]` + "\n\n"
+p[2]` + "\n"
 	assertREPLText(t, buffer, expected)
 	buffer.Reset()
 
 	repl.OneShot(ctx, "package abc")
 	repl.OneShot(ctx, "show")
 
-	assertREPLText(t, buffer, "package abc\n\n")
+	assertREPLText(t, buffer, "package abc\n")
 	buffer.Reset()
 
 	repl.OneShot(ctx, "package repl_test")
@@ -381,12 +422,13 @@ func TestTypes(t *testing.T) {
 	repl := newRepl(store, &buffer)
 
 	repl.OneShot(ctx, "types")
-	repl.OneShot(ctx, "data.repl.version[x]")
+	repl.OneShot(ctx, `p[x] = y { x := "a"; y := 1 }`)
+	repl.OneShot(ctx, `p[x]`)
 
 	output := strings.TrimSpace(buffer.String())
 
 	exp := []string{
-		"# data.repl.version[x]: string",
+		"# data.repl.p[x]: number",
 		"# x: string",
 	}
 
@@ -504,6 +546,26 @@ func TestUnknownJSON(t *testing.T) {
 
 	if len(result.Partial.Queries) != 3 {
 		t.Fatalf("Expected exactly 3 queries in partial evaluation output but got: %v", result)
+	}
+}
+
+func TestUnknownInvalid(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.New()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+
+	err := repl.OneShot(ctx, "unknown x-1")
+	if err == nil || !strings.Contains(err.Error(), "usage: unknown <input/data reference>") {
+		t.Fatal("expected error from setting bad unknown but got:", err)
+	}
+
+	// Ensure that partial evaluation has not been enabled.
+	buffer.Reset()
+	repl.OneShot(ctx, "1+2")
+	result := strings.TrimSpace(buffer.String())
+	if result != "3" {
+		t.Fatal("want true but got:", result)
 	}
 }
 
@@ -845,6 +907,20 @@ func TestEvalConstantRule(t *testing.T) {
 	}
 }
 
+func TestEvalConstantRuleDefaultRootDoc(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "input = 1")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 2")
+	assertREPLText(t, buffer, "undefined\n")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 1")
+	assertREPLText(t, buffer, "true\n")
+}
+
 func TestEvalConstantRuleAssignment(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore()
@@ -862,6 +938,14 @@ func TestEvalConstantRuleAssignment(t *testing.T) {
 	repl.OneShot(ctx, "x := 2")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()
+
+	repl.OneShot(ctx, "show")
+	assertREPLText(t, buffer, `package repl
+
+x := 2
+`)
+	buffer.Reset()
+
 	repl.OneShot(ctx, "x := 3")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()
@@ -889,6 +973,12 @@ func TestEvalConstantRuleAssignment(t *testing.T) {
 	result = buffer.String()
 	if result != "1\n" {
 		t.Fatalf("Expected 1 but got: %v", result)
+	}
+
+	buffer.Reset()
+	err := repl.OneShot(ctx, "assign()")
+	if err == nil || !strings.Contains(err.Error(), "too few arguments") {
+		t.Fatal("Expected type check error but got:", err)
 	}
 }
 
@@ -1625,6 +1715,38 @@ func TestEvalBodyRewrittenRef(t *testing.T) {
 	}
 }
 
+func TestEvalBodySomeDecl(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "json")
+	repl.OneShot(ctx, "some x; x = 1")
+	exp := util.MustUnmarshalJSON([]byte(`{
+		"result": [
+			{
+				"expressions": [
+					{
+						"value": true,
+						"text": "x = 1",
+						"location": {
+							"row": 1,
+							"col": 9
+						}
+					}
+				],
+				"bindings": {
+					"x": 1
+				}
+			}
+		]
+	}`))
+	result := util.MustUnmarshalJSON(buffer.Bytes())
+	if util.Compare(result, exp) != 0 {
+		t.Fatalf("Expected %v but got: %v", exp, result)
+	}
+}
+
 func TestEvalImport(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore()
@@ -1715,6 +1837,84 @@ func TestMetrics(t *testing.T) {
 	if expected != buffer.String() {
 		t.Fatalf("Expected output to be exactly:\n%v\n\nGot:\n\n%v\n", expected, buffer.String())
 	}
+}
+
+func TestProfile(t *testing.T) {
+	store := newTestStore()
+	ctx := context.Background()
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+	const numLines = 21
+
+	mod2 := []byte(`package rbac
+
+		input = {
+		"subject": "bob",
+			"resource": "foo123",
+			"action": "write",
+	}
+		bindings = [
+	{
+		"user": "alice",
+		"roles": ["dev", "test"],
+	},
+	{
+		"user": "bob",
+		"roles": ["test"],
+	},
+]
+
+	roles = [
+	{
+		"name": "dev",
+		"permissions": [
+		{"resource": "foo123", "action": "write"},
+		{"resource": "foo123", "action": "read"},
+	],
+	},
+	{
+		"name": "test",
+		"permissions": [{"resource": "foo123", "action": "read"}],
+	},
+]
+
+default allow = false
+
+	allow {
+	user_has_role[role_name]
+	role_has_permission[role_name]
+	}
+
+	user_has_role[role_name] {
+	binding := bindings[_]
+	binding.user = input.subject
+	role_name := binding.roles[_]
+	}
+
+	role_has_permission[role_name] {
+	role := roles[_]
+	role_name := role.name
+	perm := role.permissions[_]
+	perm.resource = input.resource
+	perm.action = input.action
+	}`)
+
+	if err := store.UpsertPolicy(ctx, txn, "mod2", mod2); err != nil {
+		panic(err)
+	}
+	if err := store.Commit(ctx, txn); err != nil {
+		panic(err)
+	}
+
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "profile")
+	repl.OneShot(ctx, "data.rbac.allow")
+	result := buffer.String()
+	lines := strings.Split(result, "\n")
+	if len(lines) != numLines {
+		t.Fatal("Expected 21 lines, got :", len(lines))
+	}
+	buffer.Reset()
 }
 
 func TestInstrument(t *testing.T) {
@@ -1816,6 +2016,28 @@ Redo data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
 +---+---+---+---+`)
 	expected += "\n"
 
+	if expected != buffer.String() {
+		t.Fatalf("Expected output to be exactly:\n%v\n\nGot:\n\n%v\n", expected, buffer.String())
+	}
+}
+
+func TestEvalNotes(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, `p { a = [1,2,3]; a[i] = x; x > 1; trace(sprintf("x = %d", [x])) }`)
+	repl.OneShot(ctx, "notes")
+	buffer.Reset()
+	repl.OneShot(ctx, "p")
+	expected := strings.TrimSpace(`Enter data.repl.p = _
+| Enter data.repl.p
+| | Note "x = 2"
+Redo data.repl.p = _
+| Redo data.repl.p
+| | Note "x = 3"
+true`)
+	expected += "\n"
 	if expected != buffer.String() {
 		t.Fatalf("Expected output to be exactly:\n%v\n\nGot:\n\n%v\n", expected, buffer.String())
 	}

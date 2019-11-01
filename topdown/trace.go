@@ -44,14 +44,23 @@ const (
 	IndexOp Op = "Index"
 )
 
+// VarMetadata provides some user facing information about
+// a variable in some policy.
+type VarMetadata struct {
+	Name     string        `json:"name"`
+	Location *ast.Location `json:"location"`
+}
+
 // Event contains state associated with a tracing event.
 type Event struct {
-	Op       Op            // Identifies type of event.
-	Node     interface{}   // Contains AST node relevant to the event.
-	QueryID  uint64        // Identifies the query this event belongs to.
-	ParentID uint64        // Identifies the parent query this event belongs to.
-	Locals   *ast.ValueMap // Contains local variable bindings from the query context.
-	Message  string        // Contains message for Note events.
+	Op            Op                     // Identifies type of event.
+	Node          ast.Node               // Contains AST node relevant to the event.
+	Location      *ast.Location          // The location of the Node this event relates to.
+	QueryID       uint64                 // Identifies the query this event belongs to.
+	ParentID      uint64                 // Identifies the parent query this event belongs to.
+	Locals        *ast.ValueMap          // Contains local variable bindings from the query context.
+	LocalMetadata map[string]VarMetadata // Contains metadata for the local variable bindings.
+	Message       string                 // Contains message for Note events.
 }
 
 // HasRule returns true if the Event contains an ast.Rule.
@@ -157,7 +166,12 @@ func formatEvent(event *Event, depth int) string {
 	} else if event.Message != "" {
 		return fmt.Sprintf("%v%v %v %v", padding, event.Op, event.Node, event.Message)
 	} else {
-		return fmt.Sprintf("%v%v %v", padding, event.Op, event.Node)
+		switch node := event.Node.(type) {
+		case *ast.Rule:
+			return fmt.Sprintf("%v%v %v", padding, event.Op, node.Path())
+		default:
+			return fmt.Sprintf("%v%v %v", padding, event.Op, event.Node)
+		}
 	}
 }
 
@@ -204,7 +218,7 @@ func builtinTrace(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) er
 		return handleBuiltinErr(ast.Trace.Name, bctx.Location, err)
 	}
 
-	if bctx.Tracer == nil || !bctx.Tracer.Enabled() {
+	if !traceIsEnabled(bctx.Tracers) {
 		return iter(ast.BooleanTerm(true))
 	}
 
@@ -214,9 +228,21 @@ func builtinTrace(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) er
 		ParentID: bctx.ParentID,
 		Message:  string(str),
 	}
-	bctx.Tracer.Trace(evt)
+
+	for i := range bctx.Tracers {
+		bctx.Tracers[i].Trace(evt)
+	}
 
 	return iter(ast.BooleanTerm(true))
+}
+
+func traceIsEnabled(tracers []Tracer) bool {
+	for i := range tracers {
+		if tracers[i].Enabled() {
+			return true
+		}
+	}
+	return false
 }
 
 func init() {

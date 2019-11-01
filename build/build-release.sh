@@ -41,8 +41,7 @@ elif [ -z "$SOURCE_URL" ]; then
     exit 1
 fi
 
-build_binaries() {
-    make deps
+build_release() {
     GOOS=darwin GOARCH=amd64 make build
     GOOS=linux GOARCH=amd64 make build
     GOOS=windows GOARCH=amd64 make build
@@ -60,8 +59,7 @@ clone_repo() {
 
 main() {
     clone_repo
-    build_binaries
-    $BUILD_DIR/build-docs.sh --output-dir=$OUTPUT_DIR
+    build_release
     make test
 }
 

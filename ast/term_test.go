@@ -84,6 +84,40 @@ func TestInterfaceToValue(t *testing.T) {
 
 }
 
+func TestObjectInsertGetLen(t *testing.T) {
+	tests := []struct {
+		insert   [][2]string
+		expected map[string]string
+	}{
+		{[][2]string{{`null`, `value1`}, {`null`, `value2`}}, map[string]string{`null`: `value2`}},
+		{[][2]string{{`false`, `value`}, {`true`, `value1`}, {`true`, `value2`}}, map[string]string{`false`: `value`, `true`: `value2`}},
+		{[][2]string{{`0`, `value`}, {`1`, `value1`}, {`1`, `value2`}, {`1.5`, `value`}}, map[string]string{`0`: `value`, `1`: `value2`, `1.5`: `value`}},
+		{[][2]string{{`"string"`, `value1`}, {`"string"`, `value2`}}, map[string]string{`"string"`: `value2`}},
+		{[][2]string{{`["other"]`, `value1`}, {`["other"]`, `value2`}}, map[string]string{`["other"]`: `value2`}},
+	}
+
+	for _, tc := range tests {
+		o := NewObject()
+		for _, kv := range tc.insert {
+			o.Insert(MustParseTerm(kv[0]), MustParseTerm(kv[1]))
+
+			if v := o.Get(MustParseTerm(kv[0])); v == nil || !MustParseTerm(kv[1]).Equal(v) {
+				t.Errorf("Expected the object to contain %v", v)
+			}
+		}
+
+		if o.Len() != len(tc.expected) {
+			t.Errorf("Expected the object to have %v entries", len(tc.expected))
+		}
+
+		for k, v := range tc.expected {
+			if x := o.Get(MustParseTerm(k)); x == nil || !MustParseTerm(v).Equal(x) {
+				t.Errorf("Expected the object to contain %v", k)
+			}
+		}
+	}
+}
+
 func TestObjectSetOperations(t *testing.T) {
 
 	a := MustParseTerm(`{"a": "b", "c": "d"}`).Value.(Object)
@@ -178,6 +212,7 @@ func TestFind(t *testing.T) {
 		expected interface{}
 	}{
 		{RefTerm(StringTerm("foo"), IntNumberTerm(1), StringTerm("bar")), MustParseTerm(`{2, 3, 4}`)},
+		{RefTerm(StringTerm("foo"), IntNumberTerm(1), StringTerm("bar"), IntNumberTerm(4)), MustParseTerm(`4`)},
 		{RefTerm(StringTerm("foo"), IntNumberTerm(2)), fmt.Errorf("not found")},
 		{RefTerm(StringTerm("baz"), StringTerm("qux"), IntNumberTerm(0)), MustParseTerm(`"hello"`)},
 	}
@@ -418,6 +453,49 @@ func TestRefConcat(t *testing.T) {
 	}
 }
 
+func TestRefPtr(t *testing.T) {
+	cases := []string{
+		"",
+		"a",
+		"a/b",
+		"/a/b",
+		"/a/b/",
+		"a%2Fb",
+	}
+
+	for _, tc := range cases {
+		ref, err := PtrRef(DefaultRootDocument.Copy(), tc)
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		ptr, err := ref.Ptr()
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		roundtrip, err := PtrRef(DefaultRootDocument.Copy(), ptr)
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		if !ref.Equal(roundtrip) {
+			t.Fatalf("Expected roundtrip of %q to be equal but got %v and %v", tc, ref, roundtrip)
+		}
+	}
+
+	if _, err := PtrRef(DefaultRootDocument.Copy(), "2%"); err == nil {
+		t.Fatalf("Expected error from %q", "2%")
+	}
+
+	ref := Ref{VarTerm("x"), IntNumberTerm(1)}
+
+	if _, err := ref.Ptr(); err == nil {
+		t.Fatal("Expected error from x[1]")
+	}
+
+}
+
 func TestSetEqual(t *testing.T) {
 	tests := []struct {
 		a        string
@@ -478,6 +556,41 @@ func TestSetMap(t *testing.T) {
 
 }
 
+func TestSetAddContainsLen(t *testing.T) {
+	tests := []struct {
+		add      []string
+		expected []string
+	}{
+		{[]string{`null`, `null`}, []string{`null`}},
+		{[]string{`true`, `true`, `false`}, []string{`true`, `false`}},
+		{[]string{`0`, `1`, `1`, `1.5`}, []string{`0`, `1`, `1.5`}},
+		{[]string{`"string"`, `"string"`}, []string{`"string"`}},
+		{[]string{`["other"]`, `["other"]`}, []string{`["other"]`}},
+	}
+
+	for _, tc := range tests {
+		s := NewSet()
+		for _, v := range tc.add {
+			x := MustParseTerm(v)
+			s.Add(x)
+
+			if !s.Contains(x) {
+				t.Errorf("Expected the set to contain %v", v)
+			}
+		}
+
+		if s.Len() != len(tc.expected) {
+			t.Errorf("Expected the set to have %v entries", len(tc.expected))
+		}
+
+		for _, v := range tc.expected {
+			if !s.Contains(MustParseTerm(v)) {
+				t.Errorf("Expected the set to contain %v", v)
+			}
+		}
+	}
+}
+
 func TestSetOperations(t *testing.T) {
 
 	tests := []struct {
@@ -511,6 +624,25 @@ func TestSetOperations(t *testing.T) {
 		if result.Compare(s3) != 0 {
 			t.Errorf("Expected %v for %v %v %v but got: %v", s3, tc.a, tc.op, tc.b, result)
 		}
+	}
+}
+
+func TestSetCopy(t *testing.T) {
+	orig := MustParseTerm("{1,2,3}")
+	cpy := orig.Copy()
+	Walk(NewGenericVisitor(func(x interface{}) bool {
+		if Compare(IntNumberTerm(2), x) == 0 {
+			x.(*Term).Value = String("modified")
+		}
+		return false
+	}), orig)
+	expOrig := MustParseTerm(`{1, "modified", 3}`)
+	expCpy := MustParseTerm(`{1,2,3}`)
+	if !expOrig.Equal(orig) {
+		t.Errorf("Expected %v but got %v", expOrig, orig)
+	}
+	if !expCpy.Equal(cpy) {
+		t.Errorf("Expected %v but got %v", expCpy, cpy)
 	}
 }
 
@@ -603,6 +735,86 @@ func TestValueToInterface(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("Expected error from JSON(%v)", term)
+	}
+}
+
+func TestLocationCompare(t *testing.T) {
+
+	tests := []struct {
+		a   string
+		b   string
+		exp int
+	}{
+		{
+			a:   "",
+			b:   "",
+			exp: 0,
+		},
+		{
+			a:   "",
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   "",
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 0,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "b", "row": 1, "col": 1}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "b", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 2, "col": 1}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 2, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 2}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 2}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+	}
+
+	unmarshal := func(s string) *Location {
+		if s != "" {
+			var loc Location
+			if err := util.Unmarshal([]byte(s), &loc); err != nil {
+				t.Fatal(err)
+			}
+			return &loc
+		}
+		return nil
+	}
+
+	for _, tc := range tests {
+		locA := unmarshal(tc.a)
+		locB := unmarshal(tc.b)
+		result := locA.Compare(locB)
+		if tc.exp != result {
+			t.Fatalf("Expected %v but got %v for %v.Compare(%v)", tc.exp, result, locA, locB)
+		}
 	}
 }
 

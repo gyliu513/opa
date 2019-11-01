@@ -1,5 +1,6 @@
 #include "string.h"
 #include "json.h"
+#include "malloc.h"
 
 void opa_test_fail(const char *note, const char *func, const char *file, int line);
 void opa_test_pass(const char *note, const char *func);
@@ -19,6 +20,25 @@ void opa_test_pass(const char *note, const char *func);
     {                                                      \
         opa_test_pass(note, __func__);                     \
     }
+
+void test_opa_malloc()
+{
+    // NOTE(tsandall): These numbers are not particularly important. They're
+    // sized to cause opa_malloc to call grow.memory. The tester initializes
+    // memory with 2 pages so we allocate ~4 pages of memory here.
+    const int N = 256;
+    const int S = 1024;
+
+    for(int i = 0; i < N; i++)
+    {
+        char *buf = opa_malloc(S);
+
+        for(int x = 0; x < S; x++)
+        {
+            buf[x] = x % 255;
+        }
+    }
+}
 
 void test_opa_strlen()
 {
@@ -42,6 +62,32 @@ void test_opa_strcmp()
     test("greater than", opa_strcmp("1243", "1234") > 0);
     test("shorter", opa_strcmp("123", "1234") < 0);
     test("longer", opa_strcmp("1234", "123") > 0);
+}
+
+void test_opa_itoa()
+{
+    char buf[sizeof(long long)*8+1];
+
+    test("itoa", opa_strcmp(opa_itoa(0, buf, 10), "0") == 0);
+    test("itoa", opa_strcmp(opa_itoa(-128, buf, 10), "-128") == 0);
+    test("itoa", opa_strcmp(opa_itoa(127, buf, 10), "127") == 0);
+    test("itoa", opa_strcmp(opa_itoa(0x7FFFFFFFFFFFFFFF, buf, 10), "9223372036854775807") == 0);
+    test("itoa", opa_strcmp(opa_itoa(0x8000000000000001, buf, 10), "-9223372036854775807") == 0);
+    test("itoa", opa_strcmp(opa_itoa(0xFFFFFFFFFFFFFFFF, buf, 10), "-1") == 0);
+
+    test("itoa/base2", opa_strcmp(opa_itoa(0, buf, 2), "0") == 0);
+    test("itoa/base2", opa_strcmp(opa_itoa(-128, buf, 2), "-10000000") == 0);
+    test("itoa/base2", opa_strcmp(opa_itoa(127, buf, 2), "1111111") == 0);
+    test("itoa/base2", opa_strcmp(opa_itoa(0x7FFFFFFFFFFFFFFF, buf, 2), "111111111111111111111111111111111111111111111111111111111111111") == 0);
+    test("itoa/base2", opa_strcmp(opa_itoa(0x8000000000000001, buf, 2), "-111111111111111111111111111111111111111111111111111111111111111") == 0);
+    test("itoa/base2", opa_strcmp(opa_itoa(0xFFFFFFFFFFFFFFFF, buf, 2), "-1") == 0);
+
+    test("itoa/base16", opa_strcmp(opa_itoa(0, buf, 16), "0") == 0);
+    test("itoa/base16", opa_strcmp(opa_itoa(-128, buf, 16), "-80") == 0);
+    test("itoa/base16", opa_strcmp(opa_itoa(127, buf, 16), "7f") == 0);
+    test("itoa/base16", opa_strcmp(opa_itoa(0x7FFFFFFFFFFFFFFF, buf,16), "7fffffffffffffff") == 0);
+    test("itoa/base16", opa_strcmp(opa_itoa(0x8000000000000001, buf, 16), "-7fffffffffffffff") == 0);
+    test("itoa/base16", opa_strcmp(opa_itoa(0xFFFFFFFFFFFFFFFF, buf, 16), "-1") == 0);
 }
 
 int lex_crunch(const char *s)
@@ -204,6 +250,29 @@ void test_opa_value_compare()
     test("objects", opa_value_compare(v2, v3) < 0);
     test("objects", opa_value_compare(v4, v1) > 0);
     test("objects", opa_value_compare(v4, v2) < 0);
+
+    opa_set_t *set1 = opa_cast_set(opa_set());
+    opa_set_add(set1, opa_string_terminated("a"));
+    opa_set_add(set1, opa_string_terminated("b"));
+
+    opa_set_t *set2 = opa_cast_set(opa_set());
+    opa_set_add(set2, opa_string_terminated("a"));
+    opa_set_add(set2, opa_string_terminated("c"));
+
+    opa_set_t *set3 = opa_cast_set(opa_set());
+    opa_set_add(set3, opa_string_terminated("a"));
+    opa_set_add(set3, opa_string_terminated("b"));
+    opa_set_add(set3, opa_string_terminated("c"));
+
+    v1 = &set1->hdr;
+    v2 = &set2->hdr;
+    v3 = &set3->hdr;
+
+    test("set/object", opa_value_compare(v1, opa_object()) > 0);
+    test("sets", opa_value_compare(v1, v1) == 0);
+    test("sets", opa_value_compare(v1, v2) < 0);
+    test("sets", opa_value_compare(v2, v3) > 0); // because c > b
+    test("sets", opa_value_compare(v3, v1) > 0);
 }
 
 int parse_crunch(const char *s, opa_value *exp)
@@ -286,13 +355,23 @@ opa_object_t *fixture_object2()
     return obj;
 }
 
+opa_set_t *fixture_set1()
+{
+    opa_set_t *set = opa_cast_set(opa_set());
+    opa_set_add(set, opa_string_terminated("a"));
+    opa_set_add(set, opa_string_terminated("b"));
+    return set;
+}
+
 void test_opa_value_length()
 {
     opa_array_t *arr = fixture_array1();
     opa_object_t *obj = fixture_object1();
+    opa_set_t *set = fixture_set1();
 
     test("arrays", opa_value_length(&arr->hdr) == 4);
     test("objects", opa_value_length(&obj->hdr) == 2);
+    test("sets", opa_value_length(&set->hdr) == 2);
 }
 
 void test_opa_value_get_array()
@@ -433,6 +512,31 @@ void test_opa_object_insert()
     }
 }
 
+void test_opa_set_add_and_get()
+{
+    opa_set_t *set = fixture_set1();
+    opa_set_add(set, opa_string_terminated("a"));
+
+    opa_set_t *cpy = fixture_set1();
+
+    if (opa_value_compare(&set->hdr, &cpy->hdr) != 0)
+    {
+        test_fatal("set was modified by add with duplicate element");
+    }
+
+    opa_set_add(set, opa_string_terminated("c"));
+
+    if (opa_value_compare(&set->hdr, &cpy->hdr) <= 0)
+    {
+        test_fatal("set should be greater than cpy")
+    }
+
+    if (opa_value_get(&set->hdr, opa_string_terminated("c")) == NULL)
+    {
+        test_fatal("set should contain string term c")
+    }
+}
+
 void test_opa_value_iter_object()
 {
     opa_object_t *obj = fixture_object1();
@@ -445,17 +549,17 @@ void test_opa_value_iter_object()
     opa_value *exp2 = opa_string_terminated("b");
     opa_value *exp3 = NULL;
 
-    if (opa_value_not_equal(k1, exp1))
+    if (opa_value_compare(k1, exp1) != 0)
     {
         test_fatal("object iter start did not return expected value");
     }
 
-    if (opa_value_not_equal(k2, exp2))
+    if (opa_value_compare(k2, exp2) != 0)
     {
         test_fatal("object iter second did not return expected value");
     }
 
-    if (opa_value_not_equal(k3, exp3))
+    if (opa_value_compare(k3, exp3) != 0)
     {
         test_fatal("object iter third did not return expected value");
     }
@@ -476,18 +580,165 @@ void test_opa_value_iter_array()
     opa_value *exp2 = opa_number_int(1);
     opa_value *exp3 = NULL;
 
-    if (opa_value_not_equal(k1, exp1))
+    if (opa_value_compare(k1, exp1) != 0)
     {
         test_fatal("array iter start did not return expected value");
     }
 
-    if (opa_value_not_equal(k2, exp2))
+    if (opa_value_compare(k2, exp2) != 0)
     {
         test_fatal("array iter second did not return expected value");
     }
 
-    if (opa_value_not_equal(k3, exp3))
+    if (opa_value_compare(k3, exp3) != 0)
     {
         test_fatal("array iter third did not return expected value");
     }
+}
+
+void test_opa_value_iter_set()
+{
+    opa_set_t *set = opa_cast_set(opa_set());
+
+    opa_set_add(set, opa_number_int(1));
+    opa_set_add(set, opa_number_int(2));
+
+    opa_value *v1 = opa_value_iter(&set->hdr, NULL);
+    opa_value *v2 = opa_value_iter(&set->hdr, v1);
+    opa_value *v3 = opa_value_iter(&set->hdr, v2);
+
+    opa_value *exp1 = opa_number_int(1);
+    opa_value *exp2 = opa_number_int(2);
+    opa_value *exp3 = NULL;
+
+    if (opa_value_compare(v1, exp1) != 0)
+    {
+        test_fatal("set iter did not return expected value");
+    }
+
+    if (opa_value_compare(v2, exp2) != 0)
+    {
+        test_fatal("set iter second did not return expected value");
+    }
+
+    if (opa_value_compare(v3, exp3) != 0)
+    {
+        test_fatal("set iter third did not return expected value");
+    }
+}
+
+void test_opa_value_merge_fail()
+{
+    opa_value *fail = opa_value_merge(opa_number_int(1), opa_string_terminated("foo"));
+
+    if (fail != NULL)
+    {
+        test_fatal("expected merge of two scalars to fail");
+    }
+}
+
+void test_opa_value_merge_simple()
+{
+    opa_object_t *obj1 = opa_cast_object(opa_object());
+    opa_object_t *obj2 = opa_cast_object(opa_object());
+
+    opa_object_insert(obj1, opa_string_terminated("a"), opa_number_int(1));
+    opa_object_insert(obj2, opa_string_terminated("b"), opa_number_int(2));
+
+    opa_object_t *exp1 = opa_cast_object(opa_object());
+    opa_object_insert(exp1, opa_string_terminated("a"), opa_number_int(1));
+    opa_object_insert(exp1, opa_string_terminated("b"), opa_number_int(2));
+
+    opa_value *result = opa_value_merge(&obj1->hdr, &obj2->hdr);
+
+    if (result == NULL)
+    {
+        test_fatal("object merge failed");
+    }
+    else if (opa_value_compare(result, &exp1->hdr) != 0)
+    {
+        test_fatal("object merge returned unexpected result");
+    }
+}
+
+
+void test_opa_value_merge_nested()
+{
+    opa_object_t *obj1 = opa_cast_object(opa_object());
+    opa_object_t *obj1a = opa_cast_object(opa_object());
+
+    opa_object_insert(obj1a, opa_string_terminated("b"), opa_number_int(1));
+    opa_object_insert(obj1, opa_string_terminated("a"), &obj1a->hdr);
+    opa_object_insert(obj1, opa_string_terminated("c"), opa_number_int(2));
+
+    opa_object_t *obj2 = opa_cast_object(opa_object());
+    opa_object_t *obj2a = opa_cast_object(opa_object());
+
+    opa_object_insert(obj2a, opa_string_terminated("d"), opa_number_int(3));
+    opa_object_insert(obj2, opa_string_terminated("a"), &obj2a->hdr);
+    opa_object_insert(obj2, opa_string_terminated("e"), opa_number_int(4));
+
+    opa_object_t *exp1 = opa_cast_object(opa_object());
+    opa_object_t *exp1a = opa_cast_object(opa_object());
+
+    opa_object_insert(exp1a, opa_string_terminated("b"), opa_number_int(1));
+    opa_object_insert(exp1a, opa_string_terminated("d"), opa_number_int(3));
+    opa_object_insert(exp1, opa_string_terminated("a"), &exp1a->hdr);
+    opa_object_insert(exp1, opa_string_terminated("c"), opa_number_int(2));
+    opa_object_insert(exp1, opa_string_terminated("e"), opa_number_int(4));
+
+    opa_value *result = opa_value_merge(&obj1->hdr, &obj2->hdr);
+
+    if (result == NULL)
+    {
+        test_fatal("object merge failed");
+    }
+    else if (opa_value_compare(&exp1->hdr, result) != 0)
+    {
+        test_fatal("object merge returned unexpected result");
+    }
+}
+
+void test_opa_json_dump()
+{
+    test("null", opa_strcmp(opa_json_dump(opa_null()), "null") == 0);
+    test("false", opa_strcmp(opa_json_dump(opa_boolean(0)), "false") == 0);
+    test("true", opa_strcmp(opa_json_dump(opa_boolean(1)), "true") == 0);
+    test("strings", opa_strcmp(opa_json_dump(opa_string_terminated("hello\"world")), "\"hello\\\"world\"") == 0);
+    test("numbers", opa_strcmp(opa_json_dump(opa_number_int(127)), "127") == 0);
+
+    // NOTE(tsandall): the string representation is lossy. We should store
+    // user-supplied floating-point values as strings so that round-trip
+    // operations are lossless. Computed values can be lossy for the time being.
+    test("numbers/float", opa_strcmp(opa_json_dump(opa_number_float(12345.678)), "12345.7") == 0);
+
+    // NOTE(tsandall): trailing zeros should be omitted but this appears to be an open issue: https://github.com/mpaland/printf/issues/55
+    test("numbers/float", opa_strcmp(opa_json_dump(opa_number_float(10.5)), "10.5000") == 0);
+
+    opa_value *arr = opa_array();
+    test("arrays", opa_strcmp(opa_json_dump(arr), "[]") == 0);
+
+    opa_array_append(opa_cast_array(arr), opa_string_terminated("hello"));
+    test("arrays", opa_strcmp(opa_json_dump(arr), "[\"hello\"]") == 0);
+
+    opa_array_append(opa_cast_array(arr), opa_string_terminated("world"));
+    test("arrays", opa_strcmp(opa_json_dump(arr), "[\"hello\",\"world\"]") == 0);
+
+    opa_value *set = opa_set();
+    test("sets", opa_strcmp(opa_json_dump(set), "[]") == 0);
+
+    opa_set_add(opa_cast_set(set), opa_string_terminated("hello"));
+    test("sets", opa_strcmp(opa_json_dump(set), "[\"hello\"]") == 0);
+
+    opa_set_add(opa_cast_set(set), opa_string_terminated("world"));
+    test("sets", opa_strcmp(opa_json_dump(set), "[\"hello\",\"world\"]") == 0);
+
+    opa_value *obj = opa_object();
+    test("objects", opa_strcmp(opa_json_dump(obj), "{}") == 0);
+
+    opa_object_insert(opa_cast_object(obj), opa_string_terminated("k1"), opa_string_terminated("v1"));
+    test("objects", opa_strcmp(opa_json_dump(obj), "{\"k1\":\"v1\"}") == 0);
+
+    opa_object_insert(opa_cast_object(obj), opa_string_terminated("k2"), opa_string_terminated("v2"));
+    test("objects", opa_strcmp(opa_json_dump(obj), "{\"k1\":\"v1\",\"k2\":\"v2\"}") == 0);
 }

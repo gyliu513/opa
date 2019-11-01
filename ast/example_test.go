@@ -91,8 +91,7 @@ min_x = 100 { true }`
 			// instead.
 			ast.NewQueryContext().
 				WithPackage(ast.MustParsePackage(`package opa.example`)).
-				WithImports(ast.MustParseImports("import input.query_arg")).
-				WithInput(ast.MustParseTerm(`{"query_arg": 1000, "bar": [1,2,3]}`).Value),
+				WithImports(ast.MustParseImports("import input.query_arg")),
 		)
 
 	// Parse the input query to obtain the AST representation.
@@ -110,5 +109,5 @@ min_x = 100 { true }`
 
 	// Output:
 	//
-	// Compiled: data.opa.example.p[x]; __local0__ = input.query_arg; lt(x, __local0__)
+	// Compiled: data.opa.example.p[x]; __localq0__ = input.query_arg; lt(x, __localq0__)
 }

@@ -5,12 +5,15 @@
 package ast
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/open-policy-agent/opa/metrics"
+	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/util/test"
 )
@@ -95,6 +98,10 @@ s[2] { true }`,
 	if user.Hide {
 		t.Fatalf("Expected user.system node to be visible")
 	}
+
+	if !isVirtual(tree, MustParseRef("data.a.b.empty")) {
+		t.Fatal("Expected data.a.b.empty to be virtual")
+	}
 }
 
 func TestCompilerEmpty(t *testing.T) {
@@ -108,6 +115,19 @@ func TestCompilerExample(t *testing.T) {
 	m := MustParseModule(testModule)
 	c.Compile(map[string]*Module{"testMod": m})
 	assertNotFailed(t, c)
+}
+
+func TestCompilerWithStageAfter(t *testing.T) {
+	c := NewCompiler().WithStageAfter(
+		"CheckRecursion",
+		CompilerStageDefinition{"MockStage", "mock_stage", mockStageFunctionCall},
+	)
+	m := MustParseModule(testModule)
+	c.Compile(map[string]*Module{"testMod": m})
+
+	if !c.Failed() {
+		t.Errorf("Expected compilation error")
+	}
 }
 
 func TestCompilerFunctions(t *testing.T) {
@@ -329,8 +349,8 @@ func TestCompilerErrorLimit(t *testing.T) {
 
 	errs := c.Errors
 	exp := []string{
-		"2:2: rego_unsafe_var_error: var x is unsafe",
-		"2:2: rego_unsafe_var_error: var z is unsafe",
+		"2:20: rego_unsafe_var_error: var x is unsafe",
+		"2:20: rego_unsafe_var_error: var z is unsafe",
 		"rego_compile_error: error limit reached",
 	}
 
@@ -417,7 +437,6 @@ func TestCompilerCheckSafetyBodyReordering(t *testing.T) {
 		contains(x, "oo")
 	`},
 		{"userfunc", `split(y, ".", z); data.a.b.funcs.fn("...foo.bar..", y)`, `data.a.b.funcs.fn("...foo.bar..", y); split(y, ".", z)`},
-		{"call-vars", `data.f.g[i](1); i = "foo"`, `i = "foo"; data.f.g[i](1)`},
 	}
 
 	for i, tc := range tests {
@@ -528,7 +547,6 @@ func TestCompilerCheckSafetyBodyErrors(t *testing.T) {
 		{"with-value-2", `p { x = data.a.b.d.t with input as x }`, `{x,}`},
 		{"else-kw", "p { false } else { count(x, 1) }", `{x,}`},
 		{"function", "foo(x) = [y, z] { split(x, y, z) }", `{y,z}`},
-		{"call-vars", "p { f[i].g[j](1) }", `{i, j}`},
 		{"call-vars-input", "p { f(x, x) } f(x) = x { true }", `{x,}`},
 		{"call-no-output", "p { f(x) } f(x) = x { true }", `{x,}`},
 		{"call-too-few", "p { f(1,x) } f(x,y) { true }", "{x,}"},
@@ -583,6 +601,30 @@ func TestCompilerCheckSafetyBodyErrors(t *testing.T) {
 	}
 }
 
+func TestCompilerCheckSafetyVarLoc(t *testing.T) {
+
+	_, err := CompileModules(map[string]string{"test.rego": `package test
+
+p {
+	not x
+	x > y
+}`})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	errs := err.(Errors)
+
+	if !strings.Contains(errs[0].Message, "var x is unsafe") || errs[0].Location.Row != 4 {
+		t.Fatal("expected error on row 4 but got:", err)
+	}
+
+	if !strings.Contains(errs[1].Message, "var y is unsafe") || errs[1].Location.Row != 5 {
+		t.Fatal("expected y is unsafe on row 5 but got:", err)
+	}
+}
+
 func TestCompilerCheckTypes(t *testing.T) {
 	c := NewCompiler()
 	modules := getCompilerTestModules()
@@ -619,11 +661,34 @@ f { true }
 
 g(1) { true }
 g(1,2) { true }`,
+		"mod5.rego": `package badrules.dataoverlap
+
+p { true }`,
+		"mod6.rego": `package badrules.existserr
+
+p { true }`,
+		"mod7.rego": `package badrules.redeclaration
+
+p1 := 1
+p1 := 2
+
+p2 = 1
+p2 := 2`})
+
+	c.WithPathConflictsCheck(func(path []string) (bool, error) {
+		if reflect.DeepEqual(path, []string{"badrules", "dataoverlap", "p"}) {
+			return true, nil
+		} else if reflect.DeepEqual(path, []string{"badrules", "existserr", "p"}) {
+			return false, fmt.Errorf("unexpected error")
+		}
+		return false, nil
 	})
 
 	compileStages(c, c.checkRuleConflicts)
 
 	expected := []string{
+		"rego_compile_error: conflict check for data path badrules/existserr/p: unexpected error",
+		"rego_compile_error: conflicting rule for data path badrules/dataoverlap/p found",
 		"rego_type_error: conflicting rules named f found",
 		"rego_type_error: conflicting rules named g found",
 		"rego_type_error: conflicting rules named p found",
@@ -631,9 +696,57 @@ g(1,2) { true }`,
 		"rego_type_error: multiple default rules named foo found",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:7",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:8",
+		"rego_type_error: rule named p1 redeclared at mod7.rego:4",
+		"rego_type_error: rule named p2 redeclared at mod7.rego:7",
 	}
 
 	assertCompilerErrorStrings(t, c, expected)
+}
+
+func TestCompilerCheckUndefinedFuncs(t *testing.T) {
+
+	module := `
+		package test
+
+		undefined_function {
+			data.deadbeef(x)
+		}
+
+		undefined_global {
+			deadbeef(x)
+		}
+
+		undefined_dynamic_dispatch {
+			x = "f"; data.test2[x](1)  # not currently supported
+		}
+	`
+
+	module2 := `
+		package test2
+
+		f(x) = x
+	`
+
+	_, err := CompileModules(map[string]string{
+		"test.rego":  module,
+		"test2.rego": module2,
+	})
+	if err == nil {
+		t.Fatal("expected errors")
+	}
+
+	result := err.Error()
+	want := []string{
+		"rego_type_error: undefined function data.deadbeef",
+		"rego_type_error: undefined function deadbeef",
+		"rego_type_error: undefined function data.test2[x]",
+	}
+
+	for _, w := range want {
+		if !strings.Contains(result, w) {
+			t.Fatalf("Expected %q in result but got: %v", w, result)
+		}
+	}
 }
 
 func TestCompilerImportsResolved(t *testing.T) {
@@ -784,7 +897,7 @@ func TestCompilerExprExpansion(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.note, func(t *testing.T) {
-			gen := newLocalVarGenerator(NullTerm())
+			gen := newLocalVarGenerator("", NullTerm())
 			expr := MustParseExpr(tc.input)
 			result := expandExpr(gen, expr.Copy())
 			if len(result) != len(tc.expected) {
@@ -1068,126 +1181,387 @@ elsekw {
 
 func TestCompilerRewriteLocalAssignments(t *testing.T) {
 
-	c := NewCompiler()
+	tests := []struct {
+		module          string
+		exp             string
+		expRewrittenMap map[Var]Var
+	}{
+		{
+			module: `
+				package test
+				body { a := 1; a > 0 }
+			`,
+			exp: `
+				package test
+				body = true { __local0__ = 1; gt(__local0__, 0) }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+			},
+		},
+		{
+			module: `
+				package test
+				head_vars(a) = b { b := a }
+			`,
+			exp: `
+				package test
+				head_vars(a) = __local0__ { __local0__ = a }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("b"),
+			},
+		},
+		{
+			module: `
+				package test
+				head_key[a] { a := 1 }
+			`,
+			exp: `
+				package test
+				head_key[__local0__] { __local0__ = 1 }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+			},
+		},
+		{
+			module: `
+				package test
+				p = {1,2,3}
+				x = 4
+				head_nested[p[x]] {
+					some x
+				}`,
+			exp: `
+					package test
+					p = {1,2,3}
+					x = 4
+					head_nested[data.test.p[__local0__]]
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("x"),
+			},
+		},
+		{
+			module: `
+				package test
+				p = {1,2}
+				head_closure_nested[p[x]] {
+					y = [true | some x; x = 1]
+				}
+			`,
+			exp: `
+				package test
+				p = {1,2}
+				head_closure_nested[data.test.p[x]] {
+					y = [true | __local0__ = 1]
+				}
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("x"),
+			},
+		},
+		{
+			module: `
+				package test
+				nested {
+					a := [1,2,3]
+					x := [true | a[i] > 1]
+				}
+			`,
+			exp: `
+				package test
+				nested = true { __local0__ = [1, 2, 3]; __local1__ = [true | gt(__local0__[i], 1)] }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+				Var("__local1__"): Var("x"),
+			},
+		},
+		{
+			module: `
+				package test
+				x = 2
+				shadow_globals[x] { x := 1 }
+			`,
+			exp: `
+				package test
+				x = 2 { true }
+				shadow_globals[__local0__] { __local0__ = 1 }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("x"),
+			},
+		},
+		{
+			module: `
+				package test
+				shadow_rule[shadow_rule] { shadow_rule := 1 }
+			`,
+			exp: `
+				package test
+				shadow_rule[__local0__] { __local0__ = 1 }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("shadow_rule"),
+			},
+		},
+		{
+			module: `
+				package test
+				shadow_roots_1 { data := 1; input := 2; input > data }
+			`,
+			exp: `
+				package test
+				shadow_roots_1 = true { __local0__ = 1; __local1__ = 2; gt(__local1__, __local0__) }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("data"),
+				Var("__local1__"): Var("input"),
+			},
+		},
+		{
+			module: `
+				package test
+				shadow_roots_2 { input := {"a": 1}; input.a > 0  }
+			`,
+			exp: `
+				package test
+				shadow_roots_2 = true { __local0__ = {"a": 1}; gt(__local0__.a, 0) }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("input"),
+			},
+		},
+		{
+			module: `
+				package test
+				skip_with_target { a := 1; input := 2; data.p with input as a }
+			`,
+			exp: `
+				package test
+				skip_with_target = true { __local0__ = 1; __local1__ = 2; data.p with input as __local0__ }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+				Var("__local1__"): Var("input"),
+			},
+		},
+		{
+			module: `
+				package test
+				shadow_comprehensions {
+					a := 1
+					[true | a := 2; b := 1]
+					b := 2
+				}
+			`,
+			exp: `
+				package test
+				shadow_comprehensions = true { __local0__ = 1; [true | __local1__ = 2; __local2__ = 1]; __local3__ = 2 }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+				Var("__local1__"): Var("a"),
+				Var("__local2__"): Var("b"),
+				Var("__local3__"): Var("b"),
+			},
+		},
+		{
+			module: `
+				package test
+					scoping {
+						[true | a := 1]
+						[true | a := 2]
+					}
+			`,
+			exp: `
+				package test
+				scoping = true { [true | __local0__ = 1]; [true | __local1__ = 2] }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+				Var("__local1__"): Var("a"),
+			},
+		},
+		{
+			module: `
+				package test
+				object_keys {
+					{k: v1, "k2": v2} := {"foo": 1, "k2": 2}
+				}
+			`,
+			exp: `
+				package test
+				object_keys = true { {k: __local0__, "k2": __local1__} = {"foo": 1, "k2": 2} }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("v1"),
+				Var("__local1__"): Var("v2"),
+			},
+		},
+		{
+			module: `
+				package test
+				head_array_comprehensions = [[x] | x := 1]
+					head_set_comprehensions = {[x] | x := 1}
+					head_object_comprehensions = {k: [x] | k := "foo"; x := 1}
+			`,
+			exp: `
+				package test
+				head_array_comprehensions = [[__local0__] | __local0__ = 1] { true }
+				head_set_comprehensions = {[__local1__] | __local1__ = 1} { true }
+				head_object_comprehensions = {__local2__: [__local3__] | __local2__ = "foo"; __local3__ = 1} { true }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("x"),
+				Var("__local1__"): Var("x"),
+				Var("__local2__"): Var("k"),
+				Var("__local3__"): Var("x"),
+			},
+		},
+		{
+			module: `
+				package test
+				rewritten_object_key {
+					k := "foo"
+					{k: 1}
+				}
+			`,
+			exp: `
+				package test
+				rewritten_object_key = true { __local0__ = "foo"; {__local0__: 1} }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("k"),
+			},
+		},
+		{
+			module: `
+				package test
+				rewritten_object_key_head[[{k: 1}]] {
+					k := "foo"
+				}
+			`,
+			exp: `
+				package test
+				rewritten_object_key_head[[{__local0__: 1}]] { __local0__ = "foo" }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("k"),
+			},
+		},
+		{
+			module: `
+				package test
+				rewritten_object_key_head_value = [{k: 1}] {
+					k := "foo"
+				}
+			`,
+			exp: `
+				package test
+				rewritten_object_key_head_value = [{__local0__: 1}] { __local0__ = "foo" }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("k"),
+			},
+		},
+		{
+			module: `
+				package test
+				skip_with_target_in_assignment {
+					input := 1
+					a := [true | true with input as 2; true with input as 3]
+				}
+			`,
+			exp: `
+				package test
+				skip_with_target_in_assignment = true { __local0__ = 1; __local1__ = [true | true with input as 2; true with input as 3] }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("input"),
+				Var("__local1__"): Var("a"),
+			},
+		},
+		{
+			module: `
+				package test
+				rewrite_value_in_assignment {
+					a := 1
+					b := 1 with input as [a]
+				}
+			`,
+			exp: `
+				package test
+				rewrite_value_in_assignment = true { __local0__ = 1; __local1__ = 1 with input as [__local0__] }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("a"),
+				Var("__local1__"): Var("b"),
+			},
+		},
+		{
+			module: `
+				package test
+				global = {}
+				ref_shadowed {
+					global := {"a": 1}
+					global.a > 0
+				}
+			`,
+			exp: `
+				package test
+				global = {} { true }
+				ref_shadowed = true { __local0__ = {"a": 1}; gt(__local0__.a, 0) }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("global"),
+			},
+		},
+		{
+			module: `
+				package test
+				f(x) = y {
+					x == 1
+					y := 2
+				} else = y {
+					x == 3
+					y := 4
+				}
+			`,
+			exp: `
+				package test
 
-	c.Modules["test1"] = MustParseModule(`package test
-
-	body { a := 1; a > 0 }
-	head_vars(a) = b { a := 1; b := a }
-	head_key[a] { a := 1 }
-	nested {
-		a := [1,2,3]
-		x := [true | a[i] > 1]
+				f(x) = __local0__ { x == 1; __local0__ = 2 } else = __local1__ { x == 3; __local1__ = 4 }
+			`,
+			expRewrittenMap: map[Var]Var{
+				Var("__local0__"): Var("y"),
+				Var("__local1__"): Var("y"),
+			},
+		},
 	}
 
-	x = 2
-	shadow_globals[x] { x := 1 }
-	shadow_rule[shadow_rule] { shadow_rule := 1 }
-	shadow_roots_1 { data := 1; input := 2; input > data }
-	shadow_roots_2 { input := {"a": 1}; input.a > 0  }
-
-	skip_with_target { a := 1; input := 2; data.p with input as a }
-
-	shadow_comprehensions {
-		a := 1
-		[true | a := 2; b := 1]
-		b := 2
-	}
-
-	scoping {
-		[true | a := 1]
-		[true | a := 2]
-	}
-
-	object_keys {
-		{k: v1, "k2": v2} := {"foo": 1, "k2": 2}
-	}
-
-	head_array_comprehensions = [[x] | x := 1]
-	head_set_comprehensions = {[x] | x := 1}
-	head_object_comprehensions = {k: [x] | k := "foo"; x := 1}
-	`)
-
-	c.Modules["test2"] = MustParseModule(`package test
-
-	f(x) = y {
-		x := 1
-		y := 2
-	} else = y {
-		x := 3
-		y := 4
-	}
-	`)
-
-	compileStages(c, c.rewriteLocalAssignments)
-	assertNotFailed(t, c)
-	if t.Failed() {
-		return
-	}
-
-	module1 := c.Modules["test1"]
-
-	expectedModule := MustParseModule(`package test
-
-	body { __local0__ = 1; __local0__ > 0 }
-	head_vars(__local1__) = __local2__ { __local1__ = 1; __local2__ = __local1__ }
-	head_key[__local3__] { __local3__ = 1 }
-	nested {
-		__local4__ = [1,2,3]
-		__local5__ = [true  | __local4__[i] > 1]
-	}
-
-	x = 2 { true }
-	shadow_globals[__local6__] { __local6__ = 1 }
-	shadow_rule[__local7__] { __local7__ = 1 }
-	shadow_roots_1 { __local8__ = 1; __local9__ = 2; __local9__ > __local8__ }
-	shadow_roots_2 { __local10__ = {"a": 1}; __local10__.a > 0 }
-
-	skip_with_target { __local11__ = 1; __local12__ = 2; data.p with input as __local11__ }
-
-	shadow_comprehensions {
-		__local13__ = 1
-		[true | __local14__ = 2; __local15__ = 1]
-		__local16__ = 2
-	}
-
-	scoping {
-		[true | __local17__ = 1]
-		[true | __local18__ = 2]
-	}
-
-	object_keys {
-		{k: __local19__, "k2": __local20__} = {"foo": 1, "k2": 2}
-	}
-
-	head_array_comprehensions = [[__local21__] | __local21__ = 1]
-	head_set_comprehensions = {[__local22__] | __local22__ = 1}
-	head_object_comprehensions = {__local23__: [__local24__] | __local23__ = "foo"; __local24__ = 1}
-	`)
-
-	if len(module1.Rules) != len(expectedModule.Rules) {
-		t.Fatalf("Expected %d rules but got %d. Expected:\n\n%v\n\nGot:\n\n%v", len(expectedModule.Rules), len(module1.Rules), expectedModule, module1)
-	}
-
-	for i := range module1.Rules {
-		a := expectedModule.Rules[i]
-		b := module1.Rules[i]
-		if !a.Equal(b) {
-			t.Errorf("Expected rule %d to be:\n\n%v\n\nGot:\n\n%v", i, a, b)
-		}
-	}
-
-	module2 := c.Modules["test2"]
-
-	resultElse := module2.Rules[0].Else
-	expectedElse := MustParseRule(`f(__local2__) = __local3__ { __local2__ = 3; __local3__ = 4 } `)
-
-	if !resultElse.Equal(expectedElse) {
-		t.Errorf("Expected else rule:\n\n%v\n\nGot:\n\n%v", expectedElse, resultElse)
+	for i, tc := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			c := NewCompiler()
+			c.Modules = map[string]*Module{
+				"test.rego": MustParseModule(tc.module),
+			}
+			compileStages(c, c.rewriteLocalVars)
+			assertNotFailed(t, c)
+			result := c.Modules["test.rego"]
+			exp := MustParseModule(tc.exp)
+			if result.Compare(exp) != 0 {
+				t.Fatalf("\nExpected:\n\n%v\n\nGot:\n\n%v", exp, result)
+			}
+			if !reflect.DeepEqual(c.RewrittenVars, tc.expRewrittenMap) {
+				t.Fatalf("\nExpected Rewritten Vars:\n\n\t%+v\n\nGot:\n\n\t%+v\n\n", tc.expRewrittenMap, c.RewrittenVars)
+			}
+		})
 	}
 
 }
-
 func TestRewriteLocalVarDeclarationErrors(t *testing.T) {
 
 	c := NewCompiler()
@@ -1201,6 +1575,7 @@ func TestRewriteLocalVarDeclarationErrors(t *testing.T) {
 		[b, r2] := [1, 2]
 		input.path == 1
 		input := "foo"
+		_ := [1 | nested := 1; nested := 2]
 	}
 
 	negation {
@@ -1219,14 +1594,20 @@ func TestRewriteLocalVarDeclarationErrors(t *testing.T) {
 		data.foo := 1
 		[z, 1] := [1, 2]
 	}
+
+	arg_redeclared(arg1) {
+		arg1 := 1
+	}
 	`)
 
-	compileStages(c, c.rewriteLocalAssignments)
+	compileStages(c, c.rewriteLocalVars)
 
 	expectedErrors := []string{
-		"var r1 assigned or referenced above",
-		"var r2 assigned or referenced above",
-		"var input assigned or referenced above",
+		"var r1 referenced above",
+		"var r2 assigned above",
+		"var input referenced above",
+		"var nested assigned above",
+		"arg arg1 redeclared",
 		"cannot assign vars inside negated expression",
 		"cannot assign to ref",
 		"cannot assign to arraycomprehension",
@@ -1259,6 +1640,290 @@ func TestRewriteLocalVarDeclarationErrors(t *testing.T) {
 			t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", strings.Join(expectedErrors, "\n"), strings.Join(result, "\n"))
 		}
 	}
+}
+
+func TestRewriteDecledVarsStage(t *testing.T) {
+
+	// Unlike the following test case, this only executes up to the
+	// RewriteLocalVars stage. This is done so that later stages like
+	// RewriteDynamics are not executed.
+
+	tests := []struct {
+		note   string
+		module string
+		exp    string
+	}{
+		{
+			note: "object ref key",
+			module: `
+				package test
+
+				p {
+					a := {"a": "a"}
+					{a.a: a.a}
+				}
+			`,
+			exp: `
+				package test
+
+				p {
+					__local0__ = {"a": "a"}
+					{__local0__.a: __local0__.a}
+				}
+			`,
+		},
+		{
+			note: "set ref element",
+			module: `
+				package test
+
+				p {
+					a := {"a": "a"}
+					{a.a}
+				}
+			`,
+			exp: `
+				package test
+
+				p {
+					__local0__ = {"a": "a"}
+					{__local0__.a}
+				}
+			`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+
+			c := NewCompiler()
+
+			c.Modules = map[string]*Module{
+				"test.rego": MustParseModule(tc.module),
+			}
+
+			compileStages(c, c.rewriteLocalVars)
+
+			exp := MustParseModule(tc.exp)
+			result := c.Modules["test.rego"]
+
+			if !exp.Equal(result) {
+				t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, result)
+			}
+		})
+	}
+}
+
+func TestRewriteDeclaredVars(t *testing.T) {
+	tests := []struct {
+		note    string
+		module  string
+		exp     string
+		wantErr error
+	}{
+		{
+			note: "rewrite unify",
+			module: `
+				package test
+				x = 1
+				y = 2
+				p { some x; input = [x, y] }
+			`,
+			exp: `
+				package test
+				x = 1
+				y = 2
+				p { __local1__ = data.test.y; input = [__local0__, __local1__] }
+			`,
+		},
+		{
+			note: "rewrite call",
+			module: `
+				package test
+				x = []
+				y = {}
+				p { some x; walk(y, [x, y]) }
+			`,
+			exp: `
+				package test
+				x = []
+				y = {}
+				p { __local1__ = data.test.y; __local2__ = data.test.y; walk(__local1__, [__local0__, __local2__]) }
+			`,
+		},
+		{
+			note: "rewrite term",
+			module: `
+				package test
+				x = "a"
+				y = 1
+				q[[2, "b"]]
+				p { some x; q[[y,x]] }
+			`,
+			exp: `
+				package test
+				x = "a"
+				y = 1
+				q[[2, "b"]]
+				p { __local1__ = data.test.y; data.test.q[[__local1__, __local0__]] }
+			`,
+		},
+		{
+			note: "rewrite closures",
+			module: `
+				package test
+				x = 1
+				y = 2
+				p {
+					some x, z
+					z = 3
+					[x | x = 2; y = 2; some z; z = 4]
+				}
+			`,
+			exp: `
+				package test
+				x = 1
+				y = 2
+				p {
+					__local1__ = 3
+					[__local0__ | __local0__ = 2; data.test.y = 2; __local2__ = 4]
+				}
+			`,
+		},
+		{
+			note: "rewrite head var",
+			module: `
+				package test
+				x = "a"
+				y = 1
+				z = 2
+				p[x] = [y, z] {
+					some x, z
+					x = "b"
+					z = 4
+				}`,
+			exp: `
+				package test
+				x = "a"
+				y = 1
+				z = 2
+				p[__local0__] = __local2__ {
+					__local0__ = "b"
+					__local1__ = 4;
+					__local3__ = data.test.y
+					__local2__ = [__local3__, __local1__]
+				}
+			`,
+		},
+		{
+			note: "redeclare err",
+			module: `
+				package test
+				p {
+					some x
+					some x
+				}
+			`,
+			wantErr: errors.New("var x declared above"),
+		},
+		{
+			note: "redeclare assigned err",
+			module: `
+				package test
+				p {
+					x := 1
+					some x
+				}
+			`,
+			wantErr: errors.New("var x assigned above"),
+		},
+		{
+			note: "redeclare reference err",
+			module: `
+				package test
+				p {
+					data.q[x]
+					some x
+				}
+			`,
+			wantErr: errors.New("var x referenced above"),
+		},
+		{
+			note: "declare unused err",
+			module: `
+				package test
+				p {
+					some x
+				}
+			`,
+			wantErr: errors.New("declared var x unused"),
+		},
+		{
+			note: "declare arg err",
+			module: `
+			package test
+
+			f([a]) {
+				some a
+				a = 1
+			}
+			`,
+			wantErr: errors.New("arg a redeclared"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			compiler, err := CompileModules(map[string]string{"test.rego": tc.module})
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatal("Expected error but got success")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr.Error()) {
+					t.Fatalf("Expected %v but got %v", tc.wantErr, err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			} else {
+				exp := MustParseModule(tc.exp)
+				result := compiler.Modules["test.rego"]
+				if exp.Compare(result) != 0 {
+					t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, result)
+				}
+			}
+		})
+	}
+}
+
+func TestCompileInvalidEqAssignExpr(t *testing.T) {
+
+	c := NewCompiler()
+
+	c.Modules["error"] = MustParseModule(`package errors
+
+
+	p {
+		# Type checking runs at a later stage so these errors will not be #
+		# caught until then. The stages before type checking should be tolerant
+		# of invalid eq and assign calls.
+		assign()
+		assign(1)
+		eq()
+		eq(1)
+	}`)
+
+	var prev func()
+	checkRecursion := reflect.ValueOf(c.checkRecursion)
+
+	for _, stage := range c.stages {
+		if reflect.ValueOf(stage.f).Pointer() == checkRecursion.Pointer() {
+			break
+		}
+		prev = stage.f
+	}
+
+	compileStages(c, prev)
+	assertNotFailed(t, c)
 }
 
 func TestCompilerRewriteComprehensionTerm(t *testing.T) {
@@ -1445,9 +2110,9 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 			expected: `p { __local0__ = data.test.arr[0]; __local1__ = data.test.arr[1]; true with input.a as __local0__ with input.b as __local1__ }`,
 		},
 		{
-			note:    "data target",
-			input:   `p { true with data.q as 1 }`,
-			wantErr: fmt.Errorf("rego_type_error: with keyword target must be input is data"),
+			note:    "invalid target",
+			input:   `p { true with foo.q as 1 }`,
+			wantErr: fmt.Errorf("rego_type_error: with keyword target must start with input or data"),
 		},
 	}
 
@@ -1469,6 +2134,34 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompilerMockFunction(t *testing.T) {
+	c := NewCompiler()
+	c.Modules["test"] = MustParseModule(`
+	package test
+
+	is_allowed(label) {
+	    label == "test_label"
+	}
+
+	p {true with data.test.is_allowed as "blah" }
+	`)
+	compileStages(c, c.rewriteWithModifiers)
+	assertCompilerErrorStrings(t, c, []string{"rego_compile_error: with keyword cannot replace functions"})
+}
+
+func TestCompilerMockVirtualDocumentPartially(t *testing.T) {
+	c := NewCompiler()
+
+	c.Modules["test"] = MustParseModule(`
+	package test
+	p = {"a": 1}
+	q = x { p = x with p.a as 2 }
+	`)
+
+	compileStages(c, c.rewriteWithModifiers)
+	assertCompilerErrorStrings(t, c, []string{"rego_compile_error: with keyword cannot partially replace virtual document(s)"})
 }
 
 func TestCompilerSetGraph(t *testing.T) {
@@ -1765,6 +2458,31 @@ dataref = true { data }`,
 	}
 }
 
+func TestCompilerCheckDynamicRecursion(t *testing.T) {
+	// This test tries to circumvent the recursion check by using dynamic
+	// references.  For more background info, see
+	// <https://github.com/open-policy-agent/opa/issues/1565>.
+	c := NewCompiler()
+	c.Modules = map[string]*Module{
+		"recursion": MustParseModule(`package recursion
+
+pkg = "recursion"
+
+foo[x] {
+  data[pkg]["foo"][x]
+}`),
+	}
+
+	compileStages(c, c.checkRecursion)
+
+	result := compilerErrsToStringSlice(c.Errors)
+	expected := "rego_recursion_error: rule foo is recursive: foo -> foo"
+
+	if len(result) != 1 || result[0] != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+}
+
 func TestCompilerGetRulesExact(t *testing.T) {
 	mods := getCompilerTestModules()
 
@@ -1984,6 +2702,11 @@ q["b"] = 2 { true }`,
 	for _, tc := range tests {
 		test.Subtest(t, tc.input, func(t *testing.T) {
 			result := compiler.GetRules(MustParseRef(tc.input))
+
+			if len(result) != len(tc.expected) {
+				t.Fatalf("Expected %v but got: %v", tc.expected, result)
+			}
+
 			for i := range result {
 				found := false
 				for j := range tc.expected {
@@ -1999,6 +2722,119 @@ q["b"] = 2 { true }`,
 		})
 	}
 
+}
+
+func TestCompilerGetRulesDynamic(t *testing.T) {
+	compiler := getCompilerWithParsedModules(map[string]string{
+		"mod1": `package a.b.c.d
+r1 = 1`,
+		"mod2": `package a.b.c.e
+r2 = 2`,
+		"mod3": `package a.b
+r3 = 3`,
+	})
+
+	compileStages(compiler, nil)
+
+	rule1 := compiler.Modules["mod1"].Rules[0]
+	rule2 := compiler.Modules["mod2"].Rules[0]
+	rule3 := compiler.Modules["mod3"].Rules[0]
+
+	tests := []struct {
+		input    string
+		expected []*Rule
+	}{
+		{"data.a.b.c.d.r1", []*Rule{rule1}},
+		{"data.a.b[x]", []*Rule{rule1, rule2, rule3}},
+		{"data.a.b[x].d", []*Rule{rule1, rule3}},
+		{"data.a.b.c", []*Rule{rule1, rule2}},
+		{"data.a.b.d", nil},
+		{"data[x]", []*Rule{rule1, rule2, rule3}},
+		{"data[data.complex_computation].b[y]", []*Rule{rule1, rule2, rule3}},
+		{"data[x][y].c.e", []*Rule{rule2}},
+		{"data[x][y].r3", []*Rule{rule3}},
+	}
+
+	for _, tc := range tests {
+		test.Subtest(t, tc.input, func(t *testing.T) {
+			result := compiler.GetRulesDynamic(MustParseRef(tc.input))
+
+			if len(result) != len(tc.expected) {
+				t.Fatalf("Expected %v but got: %v", tc.expected, result)
+			}
+
+			for i := range result {
+				found := false
+				for j := range tc.expected {
+					if result[i].Equal(tc.expected[j]) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("Expected %v but got: %v", tc.expected, result)
+				}
+			}
+		})
+	}
+
+}
+
+func TestCompileCustomBuiltins(t *testing.T) {
+
+	compiler := NewCompiler().WithBuiltins(map[string]*Builtin{
+		"baz": &Builtin{
+			Name: "baz",
+			Decl: types.NewFunction([]types.Type{types.S}, types.A),
+		},
+		"foo.bar": &Builtin{
+			Name: "foo.bar",
+			Decl: types.NewFunction([]types.Type{types.S}, types.A),
+		},
+	})
+
+	compiler.Compile(map[string]*Module{
+		"test.rego": MustParseModule(`
+			package test
+
+			p { baz("x") = x }
+			q { foo.bar("x") = x }
+		`),
+	})
+
+	// Ensure no type errors occur.
+	if compiler.Failed() {
+		t.Fatal("Unexpected compilation error:", compiler.Errors)
+	}
+
+	_, err := compiler.QueryCompiler().Compile(MustParseBody(`baz("x") = x; foo.bar("x") = x`))
+	if err != nil {
+		t.Fatal("Unexpected compilation error:", err)
+	}
+
+	// Ensure type errors occur.
+	exp1 := `rego_type_error: baz: invalid argument(s)`
+	exp2 := `rego_type_error: foo.bar: invalid argument(s)`
+
+	_, err = compiler.QueryCompiler().Compile(MustParseBody(`baz(1) = x; foo.bar(1) = x`))
+	if err == nil {
+		t.Fatal("Expected compilation error")
+	} else if !strings.Contains(err.Error(), exp1) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp1, err)
+	} else if !strings.Contains(err.Error(), exp2) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp2, err)
+	}
+
+	compiler.Compile(map[string]*Module{
+		"test.rego": MustParseModule(`
+			package test
+
+			p { baz(1) = x }  # type error
+			q { foo.bar(1) = x }  # type error
+		`),
+	})
+
+	assertCompilerErrorStrings(t, compiler, []string{exp1, exp2})
 }
 
 func TestCompilerLazyLoadingError(t *testing.T) {
@@ -2028,10 +2864,12 @@ import data.x.z1 as z2
 
 p = true { q; r }
 q = true { z2 }`)
+	orig1 := mod1.Copy()
 
 	mod2 := MustParseModule(`package a.b.c
 
 r = true { true }`)
+	orig2 := mod2.Copy()
 
 	mod3 := MustParseModule(`package x
 
@@ -2039,10 +2877,12 @@ import data.foo.bar
 import input.input
 
 z1 = true { [localvar | count(bar.baz.qux, localvar)] }`)
+	orig3 := mod3.Copy()
 
 	mod4 := MustParseModule(`package foo.bar.baz
 
 qux = grault { true }`)
+	orig4 := mod4.Copy()
 
 	mod5 := MustParseModule(`package foo.bar.baz
 
@@ -2050,6 +2890,7 @@ import data.d.e.f
 
 deadbeef = f { true }
 grault = deadbeef { true }`)
+	orig5 := mod5.Copy()
 
 	// testLoader will return 4 rounds of parsed modules.
 	rounds := []map[string]*Module{
@@ -2116,6 +2957,43 @@ grault = deadbeef { true }`)
 	if compiler.Compile(nil); compiler.Failed() {
 		t.Fatalf("Got unexpected error from compiler: %v", compiler.Errors)
 	}
+
+	// Check the original modules are still untouched.
+	if !mod1.Equal(orig1) || !mod2.Equal(orig2) || !mod3.Equal(orig3) || !mod4.Equal(orig4) || !mod5.Equal(orig5) {
+		t.Errorf("Compiler lazy loading modified the original modules")
+	}
+}
+
+func TestCompilerWithMetrics(t *testing.T) {
+	m := metrics.New()
+	c := NewCompiler().WithMetrics(m)
+	mod := MustParseModule(testModule)
+
+	c.Compile(map[string]*Module{"testMod": mod})
+	assertNotFailed(t, c)
+
+	if len(m.All()) == 0 {
+		t.Error("Expected to have metrics after compiling")
+	}
+}
+
+func TestCompilerWithStageAfterWithMetrics(t *testing.T) {
+	m := metrics.New()
+	c := NewCompiler().WithStageAfter(
+		"CheckRecursion",
+		CompilerStageDefinition{"MockStage", "mock_stage", mockStageFunctionCallNoErr},
+	)
+
+	c.WithMetrics(m)
+
+	mod := MustParseModule(testModule)
+
+	c.Compile(map[string]*Module{"testMod": mod})
+	assertNotFailed(t, c)
+
+	if len(m.All()) == 0 {
+		t.Error("Expected to have metrics after compiling")
+	}
 }
 
 func TestQueryCompiler(t *testing.T) {
@@ -2127,20 +3005,101 @@ func TestQueryCompiler(t *testing.T) {
 		input    string
 		expected interface{}
 	}{
-		{"rewrite assignment", "a := 1; [b, c] := data.foo", "", nil, "", "__local0__ = 1; [__local1__, __local2__] = data.foo"},
-		{"exports resolved", "z", `package a.b.c`, nil, "", "data.a.b.c.z"},
-		{"imports resolved", "z", `package a.b.c.d`, []string{"import data.a.b.c.z"}, "", "data.a.b.c.z"},
-		{"rewrite comprehensions", "[x[i] | a = [[1], [2]]; x = a[j]]", "", nil, "", "[__local0__ | a = [[1], [2]]; x = a[j]; __local0__ = x[i]]"},
-		{"unsafe vars", "z", "", nil, "", fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: var z is unsafe")},
-		{"safe vars", `data; abc`, `package ex`, []string{"import input.xyz as abc"}, `{}`, `data; input.xyz`},
-		{"reorder", `x != 1; x = 0`, "", nil, "", `x = 0; x != 1`},
-		{"bad with target", "x = 1 with data.p as null", "", nil, "", fmt.Errorf("1 error occurred: 1:12: rego_type_error: with keyword target must be input is data")},
-		{"rewrite with value", `1 with input as [z]`, "package a.b.c", nil, "", `__local1__ = data.a.b.c.z; __local0__ = [__local1__]; 1 with input as __local0__`},
-		{"unsafe exprs", "count(sum())", "", nil, "", fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: expression is unsafe")},
-		{"check types", "x = data.a.b.c.z; y = null; x = y", "", nil, "", fmt.Errorf("match error\n\tleft  : number\n\tright : null")},
+		{
+			note:     "invalid eq",
+			q:        "eq()",
+			expected: fmt.Errorf("too few arguments"),
+		},
+		{
+			note:     "invalid eq",
+			q:        "eq(1)",
+			expected: fmt.Errorf("too few arguments"),
+		},
+		{
+			note:     "rewrite assignment",
+			q:        "a := 1; [b, c] := data.foo",
+			pkg:      "",
+			imports:  nil,
+			expected: "__localq0__ = 1; [__localq1__, __localq2__] = data.foo",
+		},
+		{
+			note:     "exports resolved",
+			q:        "z",
+			pkg:      `package a.b.c`,
+			imports:  nil,
+			expected: "data.a.b.c.z",
+		},
+		{
+			note:     "imports resolved",
+			q:        "z",
+			pkg:      `package a.b.c.d`,
+			imports:  []string{"import data.a.b.c.z"},
+			expected: "data.a.b.c.z",
+		},
+		{
+			note:     "rewrite comprehensions",
+			q:        "[x[i] | a = [[1], [2]]; x = a[j]]",
+			pkg:      "",
+			imports:  nil,
+			expected: "[__localq0__ | a = [[1], [2]]; x = a[j]; __localq0__ = x[i]]",
+		},
+		{
+			note:     "unsafe vars",
+			q:        "z",
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: var z is unsafe"),
+		},
+		{
+			note:     "safe vars",
+			q:        `data; abc`,
+			pkg:      `package ex`,
+			imports:  []string{"import input.xyz as abc"},
+			expected: `data; input.xyz`,
+		},
+		{
+			note:     "reorder",
+			q:        `x != 1; x = 0`,
+			pkg:      "",
+			imports:  nil,
+			expected: `x = 0; x != 1`,
+		},
+		{
+			note:     "bad with target",
+			q:        "x = 1 with foo.p as null",
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("1 error occurred: 1:12: rego_type_error: with keyword target must start with input or data"),
+		},
+		{
+			note:     "rewrite with value",
+			q:        `1 with input as [z]`,
+			pkg:      "package a.b.c",
+			imports:  nil,
+			expected: `__localq1__ = data.a.b.c.z; __localq0__ = [__localq1__]; 1 with input as __localq0__`,
+		},
+		{
+			note:     "unsafe exprs",
+			q:        "count(sum())",
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: expression is unsafe"),
+		},
+		{
+			note:     "check types",
+			q:        "x = data.a.b.c.z; y = null; x = y",
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("match error\n\tleft  : number\n\tright : null"),
+		},
+		{
+			note:     "undefined function",
+			q:        "data.deadbeef(x)",
+			expected: fmt.Errorf("rego_type_error: undefined function data.deadbeef"),
+		},
 	}
 	for _, tc := range tests {
-		runQueryCompilerTest(t, tc.note, tc.q, tc.pkg, tc.imports, tc.input, tc.expected)
+		runQueryCompilerTest(t, tc.note, tc.q, tc.pkg, tc.imports, tc.expected)
 	}
 }
 
@@ -2150,7 +3109,8 @@ func TestQueryCompilerRewrittenVars(t *testing.T) {
 		q    string
 		vars map[string]string
 	}{
-		{"assign", "a := 1", map[string]string{"__local0__": "a"}},
+		{"assign", "a := 1", map[string]string{"__localq0__": "a"}},
+		{"suppress only seen", "b = 1; a := b", map[string]string{"__localq0__": "a"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.note, func(t *testing.T) {
@@ -2206,8 +3166,68 @@ func TestQueryCompilerRecompile(t *testing.T) {
 
 }
 
+func TestQueryCompilerWithMetrics(t *testing.T) {
+	m := metrics.New()
+	c := NewCompiler().WithMetrics(m)
+	c.Compile(getCompilerTestModules())
+	assertNotFailed(t, c)
+	m.Clear()
+
+	qc := c.QueryCompiler()
+
+	query := MustParseBody("a = 1; a > 2")
+	_, err := qc.Compile(query)
+	if err != nil {
+		t.Fatalf("Unexpected error from %v: %v", query, err)
+	}
+
+	if len(m.All()) == 0 {
+		t.Error("Expected to have metrics after compiling")
+	}
+}
+
+func TestQueryCompilerWithStageAfterWithMetrics(t *testing.T) {
+	m := metrics.New()
+	c := NewCompiler().WithMetrics(m)
+	c.Compile(getCompilerTestModules())
+	assertNotFailed(t, c)
+	m.Clear()
+
+	qc := c.QueryCompiler().WithStageAfter(
+		"CheckSafety",
+		QueryCompilerStageDefinition{
+			"MockStage",
+			"mock_stage",
+			func(qc QueryCompiler, b Body) (Body, error) {
+				return b, nil
+			},
+		})
+
+	query := MustParseBody("a = 1; a > 2")
+	_, err := qc.Compile(query)
+	if err != nil {
+		t.Fatalf("Unexpected error from %v: %v", query, err)
+	}
+
+	if len(m.All()) == 0 {
+		t.Error("Expected to have metrics after compiling")
+	}
+}
+
+func TestQueryCompilerWithUnsafeBuiltins(t *testing.T) {
+	c := NewCompiler().WithUnsafeBuiltins(map[string]struct{}{
+		"count": struct{}{},
+	})
+
+	_, err := c.QueryCompiler().WithUnsafeBuiltins(map[string]struct{}{}).Compile(MustParseBody("count([])"))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertCompilerErrorStrings(t *testing.T, compiler *Compiler, expected []string) {
 	result := compilerErrsToStringSlice(compiler.Errors)
+
 	if len(result) != len(expected) {
 		t.Fatalf("Expected %d:\n%v\nBut got %d:\n%v", len(expected), strings.Join(expected, "\n"), len(result), strings.Join(result, "\n"))
 	}
@@ -2222,6 +3242,14 @@ func assertNotFailed(t *testing.T, c *Compiler) {
 	if c.Failed() {
 		t.Errorf("Unexpected compilation error: %v", c.Errors)
 	}
+}
+
+func mockStageFunctionCall(c *Compiler) *Error {
+	return NewError(CompileErr, &Location{}, "mock stage error")
+}
+
+func mockStageFunctionCallNoErr(c *Compiler) *Error {
+	return nil
 }
 
 func getCompilerWithParsedModules(mods map[string]string) *Compiler {
@@ -2245,17 +3273,28 @@ func getCompilerWithParsedModules(mods map[string]string) *Compiler {
 // helper function to run compiler upto given stage. If nil is provided, a
 // normal compile run is performed.
 func compileStages(c *Compiler, upto func()) {
+
+	for name := range c.Modules {
+		c.sorted = append(c.sorted, name)
+	}
+
+	c.localvargen = newLocalVarGeneratorForModuleSet(c.sorted, c.Modules)
+
+	sort.Strings(c.sorted)
 	c.SetErrorLimit(0)
+
 	if upto == nil {
 		c.compile()
 		return
 	}
+
 	target := reflect.ValueOf(upto)
-	for _, fn := range c.stages {
-		if fn(); c.Failed() {
+
+	for _, s := range c.stages {
+		if s.f(); c.Failed() {
 			return
 		}
-		if reflect.ValueOf(fn).Pointer() == target.Pointer() {
+		if reflect.ValueOf(s.f).Pointer() == target.Pointer() {
 			break
 		}
 	}
@@ -2353,7 +3392,7 @@ func compilerErrsToStringSlice(errors []*Error) []string {
 	return result
 }
 
-func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, input string, expected interface{}) {
+func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, expected interface{}) {
 	test.Subtest(t, note, func(t *testing.T) {
 		c := NewCompiler()
 		c.Compile(getCompilerTestModules())
@@ -2367,9 +3406,6 @@ func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, i
 		}
 		if len(imports) != 0 {
 			qctx = qctx.WithImports(MustParseImports(strings.Join(imports, "\n")))
-		}
-		if input != "" {
-			qctx = qctx.WithInput(MustParseTerm(input).Value)
 		}
 
 		if qctx != nil {
@@ -2396,4 +3432,32 @@ func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, i
 			}
 		}
 	})
+}
+
+func TestCompilerWithUnsafeBuiltins(t *testing.T) {
+	// Rego includes a number of built-in functions. In some cases, you may not
+	// want all builtins to be available to a program. This test shows how to
+	// mark a built-in as unsafe.
+	compiler := NewCompiler().WithUnsafeBuiltins(map[string]struct{}{"re_match": struct{}{}})
+
+	// This query should not compile because the `re_match` built-in is no
+	// longer available.
+	_, err := compiler.QueryCompiler().Compile(MustParseBody(`re_match("a", "a")`))
+	if err == nil {
+		t.Fatalf("Expected error for unsafe built-in")
+	} else if !strings.Contains(err.Error(), "unsafe built-in function") {
+		t.Fatalf("Expected error for unsafe built-in but got %v", err)
+	}
+
+	// These modules should not compile for the same reason.
+	modules := map[string]*Module{"mod1": MustParseModule(`package a.b.c
+deny {
+    re_match(input.user, ".*bob.*")
+}`)}
+	compiler.Compile(modules)
+	if !compiler.Failed() {
+		t.Fatalf("Expected error for unsafe built-in")
+	} else if !strings.Contains(compiler.Errors[0].Error(), "unsafe built-in function") {
+		t.Fatalf("Expected error for unsafe built-in but got %v", err)
+	}
 }

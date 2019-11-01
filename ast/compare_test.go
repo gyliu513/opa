@@ -24,6 +24,13 @@ func TestCompare(t *testing.T) {
 		{"false", "true", -1},
 		{"true", "false", 1},
 
+		// Numbers
+		{"0", "1", -1},
+		{"1", "0", 1},
+		{"0", "0", 0},
+		{"0", "1.5", -1},
+		{"1.5", "0", 1},
+
 		// Object comparisons are consistent
 		{`{1: 2, 3: 4}`, `{4: 3, 1: 2}`, -1},
 		{`{1: 2, 3: 4}`, `{1: 2, 4: 3}`, -1},

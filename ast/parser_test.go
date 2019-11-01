@@ -142,6 +142,9 @@ func TestVarTerms(t *testing.T) {
 	assertParseOneTerm(t, "import prefix", "imports", VarTerm("imports"))
 	assertParseOneTerm(t, "not prefix", "not_foo", VarTerm("not_foo"))
 	assertParseOneTerm(t, `package prefix`, "packages", VarTerm("packages"))
+	assertParseOneTerm(t, `true prefix`, "trueish", VarTerm("trueish"))
+	assertParseOneTerm(t, `false prefix`, "false_flag", VarTerm("false_flag"))
+	assertParseOneTerm(t, `null prefix`, "nullable", VarTerm("nullable"))
 	assertParseError(t, "not keyword", "not")
 	assertParseError(t, `package keyword`, "package")
 	assertParseError(t, "import keyword", "import")
@@ -468,6 +471,65 @@ func TestExprWith(t *testing.T) {
 				Value:  MustParseTerm(`{"count": [{1,2,3}]}`),
 			},
 		},
+	})
+}
+
+func TestSomeDeclExpr(t *testing.T) {
+
+	assertParseOneExpr(t, "one", "some x", &Expr{
+		Terms: &SomeDecl{
+			Symbols: []*Term{
+				VarTerm("x"),
+			},
+		},
+	})
+
+	assertParseOneExpr(t, "multiple", "some x, y", &Expr{
+		Terms: &SomeDecl{
+			Symbols: []*Term{
+				VarTerm("x"),
+				VarTerm("y"),
+			},
+		},
+	})
+
+	assertParseOneExpr(t, "multiple split across lines", `some x, y,
+		z`, &Expr{
+		Terms: &SomeDecl{
+			Symbols: []*Term{
+				VarTerm("x"),
+				VarTerm("y"),
+				VarTerm("z"),
+			},
+		},
+	})
+
+	assertParseRule(t, "whitespace separated", `
+
+		p[x] {
+			some x
+			q[x]
+		}
+	`, &Rule{
+		Head: NewHead(Var("p"), VarTerm("x")),
+		Body: NewBody(
+			NewExpr(&SomeDecl{Symbols: []*Term{VarTerm("x")}}),
+			NewExpr(RefTerm(VarTerm("q"), VarTerm("x"))),
+		),
+	})
+
+	assertParseRule(t, "whitespace terminated", `
+
+	p[x] {
+		some x
+		x
+	}
+`, &Rule{
+		Head: NewHead(Var("p"), VarTerm("x")),
+		Body: NewBody(
+			NewExpr(&SomeDecl{Symbols: []*Term{VarTerm("x")}}),
+			NewExpr(VarTerm("x")),
+		),
 	})
 }
 
@@ -847,6 +909,15 @@ func TestRule(t *testing.T) {
 		Body: NewBody(NewExpr(BooleanTerm(true))),
 	})
 
+	assertParseRule(t, "assignment operator", `x := 1 { true }`, &Rule{
+		Head: &Head{
+			Name:   Var("x"),
+			Value:  IntNumberTerm(1),
+			Assign: true,
+		},
+		Body: NewBody(NewExpr(BooleanTerm(true))),
+	})
+
 	assertParseErrorContains(t, "empty body", `f(_) = y {}`, "rego_parse_error: found empty body")
 	assertParseErrorContains(t, "object composite key", "p[[x,y]] = z { true }", "rego_parse_error: object key must be string, var, or ref, not array")
 	assertParseErrorContains(t, "default ref value", "default p = [data.foo]", "rego_parse_error: default rule value cannot contain ref")
@@ -860,6 +931,11 @@ func TestRule(t *testing.T) {
 	// and the current error message is not very good. Need to investigate if the
 	// parser can be improved.
 	assertParseError(t, "dangling semicolon", "p { true; false; }")
+
+	assertParseErrorContains(t, "default assignment", "default p := 1", `default rules must use = operator (not := operator)`)
+	assertParseErrorContains(t, "partial assignment", `p[x] := y { true }`, "partial rules must use = operator (not := operator)")
+	assertParseErrorContains(t, "function assignment", `f(x) := y { true }`, "functions must use = operator (not := operator)")
+	assertParseErrorContains(t, "else assignment", `p := y { true } else = 2 { true } `, "else keyword cannot be used on rule declared with := operator")
 }
 
 func TestRuleElseKeyword(t *testing.T) {
@@ -1104,7 +1180,7 @@ func TestComments(t *testing.T) {
 
     import input.xyz.abc
 
-    q # interruptting
+    q # interrupting
 
 	[a] # the head of a rule
 
@@ -1140,6 +1216,48 @@ func TestComments(t *testing.T) {
 			MustParseStatement(`r[x] { x = [a | a = z[i]; b[i].a = a]; y = {a |  a = z[i]; b[i].a = a}; z = {a: i | a = z[i]; b[i].a = a} }`).(*Rule),
 		},
 	})
+
+	module, err := ParseModule("test.rego", testModule)
+	if err != nil {
+		t.Fatal("Unexpected error:", err)
+	}
+
+	exp := []struct {
+		text string
+		row  int
+		col  int
+	}{
+		{text: "end of line", row: 3, col: 28},
+		{text: "by itself", row: 6, col: 5},
+		{text: "inside a rule", row: 9, col: 9},
+		{text: "interrupting", row: 17, col: 7},
+		{text: "the head of a rule", row: 19, col: 6},
+		{text: "inside comprehension", row: 27, col: 19},
+		{text: "inside set comprehension", row: 31, col: 13},
+		{text: "inside object comprehension", row: 35, col: 15},
+	}
+
+	if len(module.Comments) != len(exp) {
+		t.Fatalf("Expected %v comments but got %v", len(exp), len(module.Comments))
+	}
+
+	for i := range exp {
+
+		expc := &Comment{
+			Text: []byte(" " + exp[i].text),
+			Location: &Location{
+				File: "test.rego",
+				Text: []byte("# " + exp[i].text),
+				Row:  exp[i].row,
+				Col:  exp[i].col,
+			},
+		}
+
+		if !expc.Equal(module.Comments[i]) {
+			t.Errorf("Expected %v for %vith comment but got: %v", expc, i, module.Comments[i])
+		}
+	}
+
 }
 
 func TestExample(t *testing.T) {
@@ -1217,6 +1335,7 @@ input = 1
 data = 2
 f(1) = 2
 f(1)
+d1 := 1234
 `
 
 	assertParseModule(t, "rules from bodies", testModule, &Module{
@@ -1237,6 +1356,7 @@ f(1)
 			MustParseRule(`data = 2 { true }`),
 			MustParseRule(`f(1) = 2 { true }`),
 			MustParseRule(`f(1) = true { true }`),
+			MustParseRule("d1 := 1234 { true }"),
 		},
 	})
 
@@ -1256,7 +1376,7 @@ data = {"bar": 2} { true }`
 	multipleExprs := `
     package a.b.c
 
-    pi = 3.14159, pi > 3
+    pi = 3.14159; pi > 3
     `
 
 	nonEquality := `
@@ -1302,6 +1422,11 @@ data = {"bar": 2} { true }`
 
 	p()`
 
+	assignToTerm := `
+	package a.b.c
+
+	"foo" := 1`
+
 	assertParseModuleError(t, "multiple expressions", multipleExprs)
 	assertParseModuleError(t, "non-equality", nonEquality)
 	assertParseModuleError(t, "non-var name", nonVarName)
@@ -1311,6 +1436,7 @@ data = {"bar": 2} { true }`
 	assertParseModuleError(t, "negated", negated)
 	assertParseModuleError(t, "non ref term", nonRefTerm)
 	assertParseModuleError(t, "zero args", zeroArgs)
+	assertParseModuleError(t, "assign to term", assignToTerm)
 }
 
 func TestWildcards(t *testing.T) {
@@ -1416,14 +1542,15 @@ func TestParseErrorDetails(t *testing.T) {
 
 	tests := []struct {
 		note  string
-		exp   *parserErrorDetail
+		exp   *ParserErrorDetail
+		err   string
 		input string
 	}{
 		{
 			note: "no match: bad rule name",
-			exp: &parserErrorDetail{
-				line: ".",
-				idx:  0,
+			exp: &ParserErrorDetail{
+				Line: ".",
+				Idx:  0,
 			},
 			input: `
 package test
@@ -1431,49 +1558,75 @@ package test
 		},
 		{
 			note: "no match: bad termination for comprehension",
-			exp: &parserErrorDetail{
-				line: "p = [true | true}",
-				idx:  16,
+			exp: &ParserErrorDetail{
+				Line: "p = [true | true}",
+				Idx:  16,
 			},
 			input: `
 package test
 p = [true | true}`},
 		{
 			note: "no match: non-terminated comprehension",
-			exp: &parserErrorDetail{
-				line: "p = [true | true",
-				idx:  15,
+			exp: &ParserErrorDetail{
+				Line: "p = [true | true",
+				Idx:  15,
 			},
 			input: `
 package test
 p = [true | true`},
 		{
 			note: "no match: expected expression",
-			exp: &parserErrorDetail{
-				line: "p { true; }",
-				idx:  10,
+			exp: &ParserErrorDetail{
+				Line: "p { true; }",
+				Idx:  10,
 			},
 			input: `
 package test
 p { true; }`},
 		{
 			note: "empty body",
-			exp: &parserErrorDetail{
-				line: "p { }",
-				idx:  2,
+			exp: &ParserErrorDetail{
+				Line: "p { }",
+				Idx:  2,
 			},
 			input: `
 package test
 p { }`},
 		{
 			note: "non-terminated string",
-			exp: &parserErrorDetail{
-				line: `p = "foo`,
-				idx:  4,
+			exp: &ParserErrorDetail{
+				Line: `p = "foo`,
+				Idx:  4,
 			},
 			input: `
 package test
 p = "foo`},
+		{
+			note: "rule with error begins with one tab",
+			exp: &ParserErrorDetail{
+				Line: "\tas",
+				Idx:  2,
+			},
+			input: `
+package test
+	as`,
+			err: `1 error occurred: test.rego:3: rego_parse_error: no match found
+	as
+	 ^`},
+		{
+			note: "rule term with error begins with two tabs",
+			exp: &ParserErrorDetail{
+				Line: "\t\tas",
+				Idx:  3,
+			},
+			input: `
+package test
+p = true {
+		as
+}`,
+			err: `1 error occurred: test.rego:5: rego_parse_error: no match found
+	as
+	 ^`},
 	}
 
 	for _, tc := range tests {
@@ -1484,6 +1637,9 @@ p = "foo`},
 		detail := err.(Errors)[0].Details
 		if !reflect.DeepEqual(detail, tc.exp) {
 			t.Fatalf("Expected %v but got: %v", tc.exp, detail)
+		}
+		if tc.err != "" && tc.err != err.Error() {
+			t.Fatalf("Expected error string %q but got: %q", tc.err, err.Error())
 		}
 	}
 }
@@ -1593,6 +1749,7 @@ func assertParsePackage(t *testing.T, msg string, input string, correct *Package
 }
 
 func assertParseOne(t *testing.T, msg string, input string, correct func(interface{})) {
+	t.Helper()
 	p, err := ParseStatement(input)
 	if err != nil {
 		t.Errorf("Error on test %s: parse error on %s: %s", msg, input, err)
@@ -1629,7 +1786,9 @@ func assertParseOneTermNegated(t *testing.T, msg string, input string, correct *
 }
 
 func assertParseRule(t *testing.T, msg string, input string, correct *Rule) {
+	t.Helper()
 	assertParseOne(t, msg, input, func(parsed interface{}) {
+		t.Helper()
 		rule := parsed.(*Rule)
 		if !rule.Equal(correct) {
 			t.Errorf("Error on test %s: rules not equal: %v (parsed), %v (correct)", msg, rule, correct)

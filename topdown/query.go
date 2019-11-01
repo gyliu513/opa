@@ -26,12 +26,22 @@ type Query struct {
 	store            storage.Store
 	txn              storage.Transaction
 	input            *ast.Term
-	tracer           Tracer
+	tracers          []Tracer
 	unknowns         []*ast.Term
 	partialNamespace string
 	metrics          metrics.Metrics
 	instr            *Instrumentation
+	disableInlining  []ast.Ref
 	genvarprefix     string
+	runtime          *ast.Term
+	builtins         map[string]*Builtin
+	indexing         bool
+}
+
+// Builtin represents a built-in function that queries can call.
+type Builtin struct {
+	Decl *ast.Builtin
+	Func BuiltinFunc
 }
 
 // NewQuery returns a new Query object that can be run.
@@ -39,6 +49,7 @@ func NewQuery(query ast.Body) *Query {
 	return &Query{
 		query:        query,
 		genvarprefix: ast.WildcardPrefix,
+		indexing:     true,
 	}
 }
 
@@ -75,9 +86,9 @@ func (q *Query) WithInput(input *ast.Term) *Query {
 	return q
 }
 
-// WithTracer sets the query tracer to use during evaluation. This is optional.
+// WithTracer adds a query tracer to use during evaluation. This is optional.
 func (q *Query) WithTracer(tracer Tracer) *Query {
-	q.tracer = tracer
+	q.tracers = append(q.tracers, tracer)
 	return q
 }
 
@@ -110,6 +121,36 @@ func (q *Query) WithPartialNamespace(ns string) *Query {
 	return q
 }
 
+// WithDisableInlining adds a set of paths to the query that should be excluded from
+// inlining. Inlining during partial evaluation can be expensive in some cases
+// (e.g., when a cross-product is computed.) Disabling inlining avoids expensive
+// computation at the cost of generating support rules.
+func (q *Query) WithDisableInlining(paths []ast.Ref) *Query {
+	q.disableInlining = paths
+	return q
+}
+
+// WithRuntime sets the runtime data to execute the query with. The runtime data
+// can be returned by the `opa.runtime` built-in function.
+func (q *Query) WithRuntime(runtime *ast.Term) *Query {
+	q.runtime = runtime
+	return q
+}
+
+// WithBuiltins adds a set of built-in functions that can be called by the
+// query.
+func (q *Query) WithBuiltins(builtins map[string]*Builtin) *Query {
+	q.builtins = builtins
+	return q
+}
+
+// WithIndexing will enable or disable using rule indexing for the evaluation
+// of the query. The default is enabled.
+func (q *Query) WithIndexing(enabled bool) *Query {
+	q.indexing = enabled
+	return q
+}
+
 // PartialRun executes partial evaluation on the query with respect to unknown
 // values. Partial evaluation attempts to evaluate as much of the query as
 // possible without requiring values for the unknowns set on the query. The
@@ -124,27 +165,33 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 	f := &queryIDFactory{}
 	b := newBindings(0, q.instr)
 	e := &eval{
-		ctx:           ctx,
-		cancel:        q.cancel,
-		query:         q.query,
-		queryIDFact:   f,
-		queryID:       f.Next(),
-		bindings:      b,
-		compiler:      q.compiler,
-		store:         q.store,
-		baseCache:     newBaseCache(),
-		txn:           q.txn,
-		input:         q.input,
-		tracer:        q.tracer,
-		instr:         q.instr,
-		builtinCache:  builtins.Cache{},
-		virtualCache:  newVirtualCache(),
-		saveSet:       newSaveSet(q.unknowns, b),
-		saveStack:     newSaveStack(),
-		saveSupport:   newSaveSupport(),
-		saveNamespace: ast.StringTerm(q.partialNamespace),
-		genvarprefix:  q.genvarprefix,
+		ctx:             ctx,
+		cancel:          q.cancel,
+		query:           q.query,
+		queryIDFact:     f,
+		queryID:         f.Next(),
+		bindings:        b,
+		compiler:        q.compiler,
+		store:           q.store,
+		baseCache:       newBaseCache(),
+		targetStack:     newRefStack(),
+		txn:             q.txn,
+		input:           q.input,
+		tracers:         q.tracers,
+		instr:           q.instr,
+		builtins:        q.builtins,
+		builtinCache:    builtins.Cache{},
+		virtualCache:    newVirtualCache(),
+		saveSet:         newSaveSet(q.unknowns, b, q.instr),
+		saveStack:       newSaveStack(),
+		saveSupport:     newSaveSupport(),
+		saveNamespace:   ast.StringTerm(q.partialNamespace),
+		disableInlining: q.disableInlining,
+		genvarprefix:    q.genvarprefix,
+		runtime:         q.runtime,
+		indexing:        q.indexing,
 	}
+	e.caller = e
 	q.startTimer(metrics.RegoPartialEval)
 	defer q.stopTimer(metrics.RegoPartialEval)
 
@@ -160,11 +207,14 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 	p := copypropagation.New(livevars)
 
 	err = e.Run(func(e *eval) error {
+
 		// Build output from saved expressions.
 		body := ast.NewBody()
+
 		for _, elem := range e.saveStack.Stack[len(e.saveStack.Stack)-1] {
 			body.Append(elem.Plug(e.bindings))
 		}
+
 		// Include bindings as exprs so that when caller evals the result, they
 		// can obtain values for the vars in their query.
 		bindingExprs := []*ast.Expr{}
@@ -172,15 +222,17 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 			bindingExprs = append(bindingExprs, ast.Equality.Expr(a, b))
 			return nil
 		})
+
 		// Sort binding expressions so that results are deterministic.
 		sort.Slice(bindingExprs, func(i, j int) bool {
 			return bindingExprs[i].Compare(bindingExprs[j]) < 0
 		})
+
 		for i := range bindingExprs {
 			body.Append(bindingExprs[i])
 		}
-		body = p.Apply(body)
-		partials = append(partials, body)
+
+		partials = append(partials, applyCopyPropagation(p, e.instr, body))
 		return nil
 	})
 
@@ -213,17 +265,21 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		compiler:     q.compiler,
 		store:        q.store,
 		baseCache:    newBaseCache(),
+		targetStack:  newRefStack(),
 		txn:          q.txn,
 		input:        q.input,
-		tracer:       q.tracer,
+		tracers:      q.tracers,
 		instr:        q.instr,
+		builtins:     q.builtins,
 		builtinCache: builtins.Cache{},
 		virtualCache: newVirtualCache(),
 		genvarprefix: q.genvarprefix,
+		runtime:      q.runtime,
+		indexing:     q.indexing,
 	}
+	e.caller = e
 	q.startTimer(metrics.RegoQueryEval)
-	defer q.stopTimer(metrics.RegoQueryEval)
-	return e.Run(func(e *eval) error {
+	err := e.Run(func(e *eval) error {
 		qr := QueryResult{}
 		e.bindings.Iter(nil, func(k, v *ast.Term) error {
 			qr[k.Value.(ast.Var)] = v
@@ -231,6 +287,8 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		})
 		return iter(qr)
 	})
+	q.stopTimer(metrics.RegoQueryEval)
+	return err
 }
 
 func (q *Query) startTimer(name string) {

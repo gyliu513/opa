@@ -8,38 +8,39 @@
 package repl
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 
-	pr "github.com/open-policy-agent/opa/internal/presentation"
-	"github.com/open-policy-agent/opa/rego"
+	"github.com/peterh/liner"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/format"
+	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/metrics"
+	"github.com/open-policy-agent/opa/profiler"
+	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/topdown"
-	"github.com/open-policy-agent/opa/version"
-	"github.com/peterh/liner"
+	"github.com/open-policy-agent/opa/topdown/lineage"
 )
 
 // REPL represents an instance of the interactive shell.
 type REPL struct {
-	output io.Writer
-	store  storage.Store
+	output  io.Writer
+	store   storage.Store
+	runtime *ast.Term
 
 	modules         map[string]*ast.Module
 	currentModuleID string
 	buffer          []string
 	txn             storage.Transaction
 	metrics         metrics.Metrics
+	profiler        bool
 
 	// TODO(tsandall): replace this state with rule definitions
 	// inside the default module.
@@ -58,11 +59,13 @@ type REPL struct {
 	prettyLimit       int
 }
 
-type explainMode int
+type explainMode string
 
 const (
-	explainOff   explainMode = iota
-	explainTrace explainMode = iota
+	explainOff   explainMode = "off"
+	explainFull              = "full"
+	explainNotes             = "notes"
+	explainFails             = "fails"
 )
 
 const defaultPrettyLimit = 80
@@ -72,70 +75,41 @@ const exitPromptMessage = "Do you want to exit ([y]/n)? "
 // New returns a new instance of the REPL.
 func New(store storage.Store, historyPath string, output io.Writer, outputFormat string, errLimit int, banner string) *REPL {
 
-	module := defaultModule()
-	moduleID := module.Package.Path.String()
-
 	return &REPL{
-		output: output,
-		store:  store,
-		modules: map[string]*ast.Module{
-			moduleID: module,
-		},
-		currentModuleID: moduleID,
-		outputFormat:    outputFormat,
-		explain:         explainOff,
-		historyPath:     historyPath,
-		initPrompt:      "> ",
-		bufferPrompt:    "| ",
-		banner:          banner,
-		errLimit:        errLimit,
-		prettyLimit:     defaultPrettyLimit,
+		output:       output,
+		store:        store,
+		modules:      map[string]*ast.Module{},
+		outputFormat: outputFormat,
+		explain:      explainOff,
+		historyPath:  historyPath,
+		initPrompt:   "> ",
+		bufferPrompt: "| ",
+		banner:       banner,
+		errLimit:     errLimit,
+		prettyLimit:  defaultPrettyLimit,
 	}
 }
 
-const (
-	defaultREPLModuleID = "repl"
-)
-
 func defaultModule() *ast.Module {
+	return ast.MustParseModule(`package repl`)
+}
 
-	module := `
-	package {{.ModuleID}}
+func defaultPackage() *ast.Package {
+	return ast.MustParsePackage(`package repl`)
+}
 
-	version = {
-		"Version": "{{.Version}}",
-		"BuildCommit": "{{.BuildCommit}}",
-		"BuildTimestamp": "{{.BuildTimestamp}}",
-		"BuildHostname": "{{.BuildHostname}}"
+func (r *REPL) getCurrentOrDefaultModule() *ast.Module {
+	if r.currentModuleID == "" {
+		return defaultModule()
 	}
-	`
+	return r.modules[r.currentModuleID]
+}
 
-	tmpl, err := template.New("").Parse(module)
-	if err != nil {
-		panic(err)
+func (r *REPL) initModule(ctx context.Context) error {
+	if r.currentModuleID != "" {
+		return nil
 	}
-
-	var buf bytes.Buffer
-
-	err = tmpl.Execute(&buf, struct {
-		ModuleID       string
-		Version        string
-		BuildCommit    string
-		BuildTimestamp string
-		BuildHostname  string
-	}{
-		ModuleID:       defaultREPLModuleID,
-		Version:        version.Version,
-		BuildCommit:    version.Vcs,
-		BuildTimestamp: version.Timestamp,
-		BuildHostname:  version.Hostname,
-	})
-
-	if err != nil {
-		panic(err)
-	}
-
-	return ast.MustParseModule(buf.String())
+	return r.evalStatement(ctx, defaultPackage())
 }
 
 // Loop will run until the user enters "exit", Ctrl+C, Ctrl+D, or an unexpected error occurs.
@@ -245,7 +219,7 @@ func (r *REPL) OneShot(ctx context.Context, line string) error {
 			case "json":
 				return r.cmdFormat("json")
 			case "show":
-				return r.cmdShow()
+				return r.cmdShow(cmd.args)
 			case "unset":
 				return r.cmdUnset(ctx, cmd.args)
 			case "pretty":
@@ -253,11 +227,17 @@ func (r *REPL) OneShot(ctx context.Context, line string) error {
 			case "pretty-limit":
 				return r.cmdPrettyLimit(cmd.args)
 			case "trace":
-				return r.cmdTrace()
+				return r.cmdTrace(explainFull)
+			case "notes":
+				return r.cmdTrace(explainNotes)
+			case "fails":
+				return r.cmdTrace(explainFails)
 			case "metrics":
 				return r.cmdMetrics()
 			case "instrument":
 				return r.cmdInstrument()
+			case "profile":
+				return r.cmdProfile()
 			case "types":
 				return r.cmdTypes()
 			case "unknown":
@@ -292,6 +272,12 @@ func (r *REPL) DisableMultiLineBuffering(yes bool) *REPL {
 // is undefined.
 func (r *REPL) DisableUndefinedOutput(yes bool) *REPL {
 	r.undefinedDisabled = yes
+	return r
+}
+
+// WithRuntime sets the runtime data to provide to the evaluation engine.
+func (r *REPL) WithRuntime(term *ast.Term) *REPL {
+	r.runtime = term
 	return r
 }
 
@@ -403,25 +389,59 @@ func (r *REPL) cmdHelp(args []string) error {
 	return nil
 }
 
-func (r *REPL) cmdShow() error {
-	module := r.modules[r.currentModuleID]
+func (r *REPL) cmdShow(args []string) error {
 
-	bs, err := format.Ast(module)
-	if err != nil {
-		return err
+	if len(args) == 0 {
+		if r.currentModuleID == "" {
+			fmt.Fprintln(r.output, "no rules defined")
+			return nil
+		}
+		module := r.modules[r.currentModuleID]
+		bs, err := format.Ast(module)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(r.output, string(bs))
+		return nil
+	} else if strings.Compare(args[0], "debug") == 0 {
+		debug := replDebugState{
+			Explain:    r.explain,
+			Metrics:    r.metricsEnabled(),
+			Instrument: r.instrument,
+			Profile:    r.profilerEnabled(),
+		}
+		b, err := json.MarshalIndent(debug, "", "\t")
+		if err != nil {
+			return fmt.Errorf("error: %v", err)
+		}
+		fmt.Fprintln(r.output, string(b))
+		return nil
+	} else {
+		return fmt.Errorf("unknown option '%v'", args[0])
 	}
+}
 
-	fmt.Fprint(r.output, string(bs))
+type replDebugState struct {
+	Explain    explainMode `json:"explain"`
+	Metrics    bool        `json:"metrics"`
+	Instrument bool        `json:"instrument"`
+	Profile    bool        `json:"profile"`
+}
+
+func (r *REPL) cmdTrace(mode explainMode) error {
+	if r.explain == mode {
+		r.explain = explainOff
+	} else {
+		r.explain = mode
+	}
 	return nil
 }
 
-func (r *REPL) cmdTrace() error {
-	if r.explain == explainTrace {
-		r.explain = explainOff
-	} else {
-		r.explain = explainTrace
+func (r *REPL) metricsEnabled() bool {
+	if r.metrics != nil {
+		return true
 	}
-	return nil
+	return false
 }
 
 func (r *REPL) cmdMetrics() error {
@@ -445,23 +465,45 @@ func (r *REPL) cmdInstrument() error {
 	return nil
 }
 
+func (r *REPL) profilerEnabled() bool {
+	return r.profiler
+}
+
+func (r *REPL) cmdProfile() error {
+	if r.profiler {
+		r.profiler = false
+	} else {
+		r.profiler = true
+	}
+	return nil
+}
+
 func (r *REPL) cmdTypes() error {
 	r.types = !r.types
 	return nil
 }
 
+var errUnknownUsage = fmt.Errorf("usage: unknown <input/data reference> [<input/data reference> [...]] (hint: try 'input')")
+
 func (r *REPL) cmdUnknown(s []string) error {
+
 	if len(s) == 0 && len(r.unknowns) == 0 {
-		return fmt.Errorf("usage: unknown <unknown-1> [<unknown-2> [...]] (hint: try just 'input')")
+		return errUnknownUsage
 	}
-	r.unknowns = make([]*ast.Term, len(s))
-	for i := range r.unknowns {
+
+	unknowns := make([]*ast.Term, len(s))
+
+	for i := range unknowns {
+
 		ref, err := ast.ParseRef(s[i])
 		if err != nil {
-			return err
+			return errUnknownUsage
 		}
-		r.unknowns[i] = ast.NewTerm(ref)
+
+		unknowns[i] = ast.NewTerm(ref)
 	}
+
+	r.unknowns = unknowns
 	return nil
 }
 
@@ -496,6 +538,9 @@ func (r *REPL) cmdUnset(ctx context.Context, args []string) error {
 }
 
 func (r *REPL) unsetRule(ctx context.Context, name ast.Var) (bool, error) {
+	if r.currentModuleID == "" {
+		return false, nil
+	}
 
 	mod := r.modules[r.currentModuleID]
 	rules := []*ast.Rule{}
@@ -548,6 +593,10 @@ func (r *REPL) recompile(ctx context.Context, cpy *ast.Module) error {
 
 	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
 
+	if r.instrument {
+		compiler.WithMetrics(r.metrics)
+	}
+
 	if compiler.Compile(policies); compiler.Failed() {
 		return compiler.Errors
 	}
@@ -556,23 +605,39 @@ func (r *REPL) recompile(ctx context.Context, cpy *ast.Module) error {
 	return nil
 }
 
-func (r *REPL) compileBody(ctx context.Context, compiler *ast.Compiler, body ast.Body, input ast.Value) (ast.Body, *ast.TypeEnv, error) {
+func (r *REPL) compileBody(ctx context.Context, compiler *ast.Compiler, body ast.Body) (ast.Body, *ast.TypeEnv, error) {
 	r.timerStart(metrics.RegoQueryCompile)
 	defer r.timerStop(metrics.RegoQueryCompile)
 
-	qctx := ast.NewQueryContext().
-		WithPackage(r.modules[r.currentModuleID].Package).
-		WithImports(r.modules[r.currentModuleID].Imports).
-		WithInput(input)
+	qctx := ast.NewQueryContext()
+
+	if r.currentModuleID != "" {
+		qctx = qctx.WithPackage(r.modules[r.currentModuleID].Package).WithImports(r.modules[r.currentModuleID].Imports)
+	}
 
 	qc := compiler.QueryCompiler()
 	body, err := qc.WithContext(qctx).Compile(body)
 	return body, qc.TypeEnv(), err
 }
 
-func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule, unset bool) error {
+func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule) error {
+
+	var unset bool
+
+	if rule.Head.Assign {
+		var err error
+		unset, err = r.unsetRule(ctx, rule.Head.Name)
+		if err != nil {
+			return err
+		}
+	}
+
 	r.timerStart(metrics.RegoModuleCompile)
 	defer r.timerStop(metrics.RegoModuleCompile)
+
+	if err := r.initModule(ctx); err != nil {
+		return err
+	}
 
 	mod := r.modules[r.currentModuleID]
 	prev := mod.Rules
@@ -592,6 +657,10 @@ func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule, unset bool) erro
 	}
 
 	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
+
+	if r.instrument {
+		compiler.WithMetrics(r.metrics)
+	}
 
 	if compiler.Compile(policies); compiler.Failed() {
 		mod.Rules = prev
@@ -689,6 +758,10 @@ func (r *REPL) loadCompiler(ctx context.Context) (*ast.Compiler, error) {
 
 	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
 
+	if r.instrument {
+		compiler.WithMetrics(r.metrics)
+	}
+
 	if compiler.Compile(policies); compiler.Failed() {
 		return nil, compiler.Errors
 	}
@@ -718,7 +791,7 @@ func (r *REPL) loadInput(ctx context.Context, compiler *ast.Compiler) (ast.Value
 }
 
 func (r *REPL) evalStatement(ctx context.Context, stmt interface{}) error {
-	switch s := stmt.(type) {
+	switch stmt := stmt.(type) {
 	case ast.Body:
 		compiler, err := r.loadCompiler(ctx)
 		if err != nil {
@@ -730,37 +803,19 @@ func (r *REPL) evalStatement(ctx context.Context, stmt interface{}) error {
 			return err
 		}
 
-		parsedBody := s
-
-		if len(parsedBody) == 1 && parsedBody[0].IsAssignment() {
-			expr := parsedBody[0]
-			rule, err := ast.ParseCompleteDocRuleFromEqExpr(r.modules[r.currentModuleID], expr.Operand(0), expr.Operand(1))
-			if err == nil {
-				ok, err := r.unsetRule(ctx, rule.Head.Name)
-				if err != nil {
-					return err
-				}
-				return r.compileRule(ctx, rule, ok)
-			}
-		}
-
-		compiledBody, typeEnv, err := r.compileBody(ctx, compiler, parsedBody, input)
-		if err != nil {
+		if ok, err := r.interpretAsRule(ctx, compiler, stmt); ok || err != nil {
 			return err
 		}
 
-		if len(compiledBody) == 1 && compiledBody[0].IsEquality() {
-			expr := compiledBody[0]
-			rule, err := ast.ParseCompleteDocRuleFromEqExpr(r.modules[r.currentModuleID], expr.Operand(0), expr.Operand(1))
-			if err == nil {
-				return r.compileRule(ctx, rule, false)
-			}
+		compiledBody, typeEnv, err := r.compileBody(ctx, compiler, stmt)
+		if err != nil {
+			return err
 		}
 
 		if len(r.unknowns) > 0 {
 			err = r.evalPartial(ctx, compiler, input, compiledBody)
 		} else {
-			err = r.evalBody(ctx, compiler, input, parsedBody)
+			err = r.evalBody(ctx, compiler, input, stmt)
 			if r.types {
 				r.printTypes(ctx, typeEnv, compiledBody)
 			}
@@ -768,52 +823,66 @@ func (r *REPL) evalStatement(ctx context.Context, stmt interface{}) error {
 
 		return err
 	case *ast.Rule:
-		return r.compileRule(ctx, s, false)
+		return r.compileRule(ctx, stmt)
 	case *ast.Import:
-		return r.evalImport(s)
+		return r.evalImport(ctx, stmt)
 	case *ast.Package:
-		return r.evalPackage(s)
+		return r.evalPackage(stmt)
 	}
 	return nil
 }
 
 func (r *REPL) evalBody(ctx context.Context, compiler *ast.Compiler, input ast.Value, body ast.Body) error {
 
-	var buf *topdown.BufferTracer
+	var tracebuf *topdown.BufferTracer
+	var prof *profiler.Profiler
 
-	if r.explain != explainOff {
-		buf = topdown.NewBufferTracer()
-	}
-
-	eval := rego.New(
+	args := []func(*rego.Rego){
 		rego.Compiler(compiler),
 		rego.Store(r.store),
 		rego.Transaction(r.txn),
-		rego.ParsedImports(r.modules[r.currentModuleID].Imports),
-		rego.ParsedPackage(r.modules[r.currentModuleID].Package),
+		rego.ParsedImports(r.getCurrentOrDefaultModule().Imports),
+		rego.ParsedPackage(r.getCurrentOrDefaultModule().Package),
 		rego.ParsedQuery(body),
 		rego.ParsedInput(input),
 		rego.Metrics(r.metrics),
-		rego.Tracer(buf),
 		rego.Instrument(r.instrument),
-	)
+		rego.Runtime(r.runtime),
+	}
 
+	if r.explain != explainOff {
+		tracebuf = topdown.NewBufferTracer()
+		args = append(args, rego.Tracer(tracebuf))
+	}
+
+	if r.profiler {
+		prof = profiler.New()
+		args = append(args, rego.Tracer(prof))
+	}
+
+	eval := rego.New(args...)
 	rs, err := eval.Eval(ctx)
 
 	output := pr.Output{
-		Error:   err,
+		Errors:  pr.NewOutputErrors(err),
 		Result:  rs,
 		Metrics: r.metrics,
 	}
 
-	output = output.WithLimit(r.prettyLimit)
-
-	if buf != nil {
-		mangleTrace(ctx, r.store, r.txn, *buf)
-		output.Explanation = *buf
+	if r.profiler {
+		output.Profile = prof.ReportTopNResults(-1, pr.DefaultProfileSortOrder)
 	}
 
-	// TODO(tsandall): add profiler output
+	output = output.WithLimit(r.prettyLimit)
+
+	switch r.explain {
+	case explainFull:
+		output.Explanation = *tracebuf
+	case explainNotes:
+		output.Explanation = lineage.Notes(*tracebuf)
+	case explainFails:
+		output.Explanation = lineage.Fails(*tracebuf)
+	}
 
 	switch r.outputFormat {
 	case "json":
@@ -835,14 +904,15 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 		rego.Compiler(compiler),
 		rego.Store(r.store),
 		rego.Transaction(r.txn),
-		rego.ParsedImports(r.modules[r.currentModuleID].Imports),
-		rego.ParsedPackage(r.modules[r.currentModuleID].Package),
+		rego.ParsedImports(r.getCurrentOrDefaultModule().Imports),
+		rego.ParsedPackage(r.getCurrentOrDefaultModule().Package),
 		rego.ParsedQuery(body),
 		rego.ParsedInput(input),
 		rego.Metrics(r.metrics),
 		rego.Tracer(buf),
 		rego.Instrument(r.instrument),
 		rego.ParsedUnknowns(r.unknowns),
+		rego.Runtime(r.runtime),
 	)
 
 	pq, err := eval.Partial(ctx)
@@ -850,11 +920,16 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 	output := pr.Output{
 		Metrics: r.metrics,
 		Partial: pq,
-		Error:   err,
+		Errors:  pr.NewOutputErrors(err),
 	}
 
-	if buf != nil {
+	switch r.explain {
+	case explainFull:
 		output.Explanation = *buf
+	case explainNotes:
+		output.Explanation = lineage.Notes(*buf)
+	case explainFails:
+		output.Explanation = lineage.Fails(*buf)
 	}
 
 	switch r.outputFormat {
@@ -865,7 +940,12 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 	}
 }
 
-func (r *REPL) evalImport(i *ast.Import) error {
+func (r *REPL) evalImport(ctx context.Context, i *ast.Import) error {
+
+	if err := r.initModule(ctx); err != nil {
+		return err
+	}
+
 	mod := r.modules[r.currentModuleID]
 
 	for _, other := range mod.Imports {
@@ -894,6 +974,61 @@ func (r *REPL) evalPackage(p *ast.Package) error {
 	r.currentModuleID = moduleID
 
 	return nil
+}
+
+// interpretAsRule attempts to interpret the supplied query as a rule
+// definition. If the query is a single := or = statement and it can be
+// converted into a rule and compiled, then it will be interpreted as such. This
+// allows users to define constants in the REPL. For example:
+//
+//	> a = 1
+//  > a
+//  1
+//
+// If the expression is a = statement, then an additional check on the left
+// hand side occurs. For example:
+//
+//	> b = 2
+//  > b = 2
+//  true      # not redefined!
+func (r *REPL) interpretAsRule(ctx context.Context, compiler *ast.Compiler, body ast.Body) (bool, error) {
+
+	if len(body) != 1 {
+		return false, nil
+	}
+
+	expr := body[0]
+
+	if len(expr.Operands()) != 2 {
+		return false, nil
+	}
+
+	if expr.IsAssignment() {
+		rule, err := ast.ParseCompleteDocRuleFromAssignmentExpr(r.getCurrentOrDefaultModule(), expr.Operand(0), expr.Operand(1))
+		if err == nil {
+			if err := r.compileRule(ctx, rule); err != nil {
+				return false, err
+			}
+		}
+		return rule != nil, nil
+	}
+
+	if !expr.IsEquality() {
+		return false, nil
+	}
+
+	if isGlobalInModule(compiler, r.getCurrentOrDefaultModule(), body[0].Operand(0)) {
+		return false, nil
+	}
+
+	rule, err := ast.ParseCompleteDocRuleFromEqExpr(r.getCurrentOrDefaultModule(), expr.Operand(0), expr.Operand(1))
+	if err == nil {
+		if err := r.compileRule(ctx, rule); err != nil {
+			return false, err
+		}
+	}
+
+	return rule != nil, nil
 }
 
 func (r *REPL) getPrompt() string {
@@ -982,7 +1117,7 @@ type exampleDesc struct {
 var examples = [...]exampleDesc{
 	{"data", "show all documents"},
 	{"data[x] = _", "show all top level keys"},
-	{"data.repl.version", "drill into specific document"},
+	{"data.system.version", "drill into specific document"},
 }
 
 var extra = [...]commandDesc{
@@ -992,14 +1127,18 @@ var extra = [...]commandDesc{
 }
 
 var builtin = [...]commandDesc{
-	{"show", []string{}, "show active module definition"},
-	{"unset", []string{"<var>"}, "undefine rules in currently active module"},
+	{"show", []string{""}, "show active module definition"},
+	{"show debug", []string{""}, "show REPL settings"},
+	{"unset", []string{"<var>"}, "unset rules in currently active module"},
 	{"json", []string{}, "set output format to JSON"},
 	{"pretty", []string{}, "set output format to pretty"},
 	{"pretty-limit", []string{}, "set pretty value output limit"},
 	{"trace", []string{}, "toggle full trace"},
+	{"notes", []string{}, "toggle notes trace"},
+	{"fails", []string{}, "toggle fails trace"},
 	{"metrics", []string{}, "toggle metrics"},
 	{"instrument", []string{}, "toggle instrumentation"},
+	{"profile", []string{}, "toggle profiler and turns off trace"},
 	{"types", []string{}, "toggle type information"},
 	{"unknown", []string{"[ref-1 [ref-2 [...]]]"}, "toggle partial evaluation mode"},
 	{"dump", []string{"[path]"}, "dump raw data in storage"},
@@ -1048,49 +1187,35 @@ func dumpStorage(ctx context.Context, store storage.Store, txn storage.Transacti
 	return e.Encode(data)
 }
 
-func mangleTrace(ctx context.Context, store storage.Store, txn storage.Transaction, trace []*topdown.Event) error {
-	for _, event := range trace {
-		if err := mangleEvent(ctx, store, txn, event); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+func isGlobalInModule(compiler *ast.Compiler, module *ast.Module, term *ast.Term) bool {
 
-func mangleEvent(ctx context.Context, store storage.Store, txn storage.Transaction, event *topdown.Event) error {
+	var name ast.Var
 
-	// Replace bindings with ref values with the values from storage.
-	cpy := event.Locals.Copy()
-	var err error
-	event.Locals.Iter(func(k, v ast.Value) bool {
-		if r, ok := v.(ast.Ref); ok {
-			var path storage.Path
-			path, err = storage.NewPathForRef(r)
-			if err != nil {
-				return true
-			}
-			var doc interface{}
-			doc, err = store.Read(ctx, txn, path)
-			if err != nil {
-				return true
-			}
-			v, err = ast.InterfaceToValue(doc)
-			if err != nil {
-				return true
-			}
-			cpy.Put(k, v)
-		}
+	if ast.RootDocumentRefs.Contains(term) {
+		name = term.Value.(ast.Ref)[0].Value.(ast.Var)
+	} else if v, ok := term.Value.(ast.Var); ok {
+		name = v
+	} else {
 		return false
-	})
-	event.Locals = cpy
-
-	switch node := event.Node.(type) {
-	case *ast.Rule:
-		event.Node = node.Head //topdown.PlugHead(node.Head, event.Locals.Get)
-	case *ast.Expr:
-		event.Node = node // topdown.PlugExpr(node, event.Locals.Get)
 	}
-	return nil
+
+	for _, imp := range module.Imports {
+		if imp.Name().Compare(name) == 0 {
+			return true
+		}
+	}
+
+	path := module.Package.Path.Copy().Append(ast.StringTerm(string(name)))
+	node := compiler.RuleTree
+
+	for _, elem := range path {
+		node = node.Child(elem.Value)
+		if node == nil {
+			return false
+		}
+	}
+
+	return len(node.Values) > 0
 }
 
 func printHelp(output io.Writer, initPrompt string) {

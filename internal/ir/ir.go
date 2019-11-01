@@ -15,20 +15,37 @@ import (
 type (
 	// Policy represents a planned policy query.
 	Policy struct {
-		Static Static
-		Plan   Plan
+		Static *Static
+		Plan   *Plan
+		Funcs  *Funcs
 	}
 
 	// Static represents a static data segment that is indexed into by the policy.
 	Static struct {
-		Strings []StringConst
+		Strings []*StringConst
 	}
 
-	// Plan represents an ordered series of blocks to execute. All plans contain a
-	// final block that returns indicating the plan result was undefined. Plan
-	// execution stops when a block returns a value. Blocks are executed in-order.
+	// Funcs represents a collection of planned functions to include in the
+	// policy.
+	Funcs struct {
+		Funcs map[string]*Func
+	}
+
+	// Func represents a named plan (function) that can be invoked. Functions
+	// accept one or more parameters and return a value. By convention, the
+	// input document and data documents are always passed as the first and
+	// second arguments (respectively).
+	Func struct {
+		Name   string
+		Params []Local
+		Return Local
+		Blocks []*Block // TODO(tsandall): should this be a plan?
+	}
+
+	// Plan represents an ordered series of blocks to execute. Plan execution
+	// stops when a return statement is reached. Blocks are executed in-order.
 	Plan struct {
-		Blocks []Block
+		Blocks []*Block
 	}
 
 	// Block represents an ordered sequence of statements to execute. Blocks are
@@ -44,7 +61,14 @@ type (
 	}
 
 	// Local represents a plan-scoped variable.
+	//
+	// TODO(tsandall): should this be int32 for safety?
 	Local int
+
+	// Const represents a constant value from the policy.
+	Const interface {
+		typeMarker()
+	}
 
 	// NullConst represents a null value.
 	NullConst struct{}
@@ -83,38 +107,74 @@ const (
 )
 
 const (
-	// InputRaw refers to the local variable containing the address of the raw
-	// (serialized) input data.
-	InputRaw Local = 0
+	// Input is the local variable that refers to the global input document.
+	Input Local = iota
 
-	// InputLen refers to the local variable containing the length of the raw input.
-	InputLen Local = 1
+	// Data is the local variable that refers to the global data document.
+	Data
 
-	// Input refers to the local variable containing the address of the deserialized
-	// input value.
-	Input Local = 2
+	// Unused is the free local variable that can be allocated in a plan.
+	Unused
 )
 
-func (a Policy) String() string {
+func (a *Policy) String() string {
 	return "Policy"
 }
 
-func (a Static) String() string {
+func (a *Static) String() string {
 	return fmt.Sprintf("Static (%d strings)", len(a.Strings))
 }
 
-func (a Plan) String() string {
+func (a *Funcs) String() string {
+	return fmt.Sprintf("Funcs (%d funcs)", len(a.Funcs))
+}
+
+func (a *Func) String() string {
+	return fmt.Sprintf("%v (%d params: %v, %d blocks)", a.Name, len(a.Params), a.Params, len(a.Blocks))
+}
+
+func (a *Plan) String() string {
 	return fmt.Sprintf("Plan (%d blocks)", len(a.Blocks))
 }
 
-func (a Block) String() string {
+func (a *Block) String() string {
 	return fmt.Sprintf("Block (%d statements)", len(a.Stmts))
 }
 
-// ReturnStmt represents a return statement. Return statements halt execution of
-// a plan with the given code.
-type ReturnStmt struct {
-	Code int32 // 32-bit integer for compatibility with languages like JavaScript.
+func (a *BooleanConst) typeMarker() {}
+func (a *NullConst) typeMarker()    {}
+func (a *IntConst) typeMarker()     {}
+func (a *FloatConst) typeMarker()   {}
+func (a *StringConst) typeMarker()  {}
+
+// ReturnLocalStmt represents a return statement that yields a local value.
+type ReturnLocalStmt struct {
+	Source Local
+}
+
+// CallStmt represents a named function call. The result should be stored in the
+// result local.
+type CallStmt struct {
+	Func   string
+	Args   []Local
+	Result Local
+}
+
+// BlockStmt represents a nested block. Nested blocks and break statements can
+// be used to short-circuit execution.
+type BlockStmt struct {
+	Blocks []*Block
+}
+
+func (a *BlockStmt) String() string {
+	return fmt.Sprintf("BlockStmt (%d blocks)", len(a.Blocks))
+}
+
+// BreakStmt represents a jump out of the current block. The index specifies how
+// many blocks to jump starting from zero (the current block). Execution will
+// continue from the end of the block that is jumped to.
+type BreakStmt struct {
+	Index uint32
 }
 
 // DotStmt represents a lookup operation on a value (e.g., array, object, etc.)
@@ -126,25 +186,63 @@ type DotStmt struct {
 	Target Local
 }
 
-// LoopStmt represents a loop operation on a composite value. The source of a
-// LoopStmt may be a scalar in which case the statement will be undefined.
-type LoopStmt struct {
+// LenStmt represents a length() operation on a local variable. The
+// result is stored in the target local variable.
+type LenStmt struct {
+	Source Local
+	Target Local
+}
+
+// ScanStmt represents a linear scan over a composite value. The
+// source may be a scalar in which case the block will never execute.
+type ScanStmt struct {
 	Source Local
 	Key    Local
 	Value  Local
-	Cond   Local
-	Block  Block
+	Block  *Block
 }
 
-// AssignStmt represents an assignment of a local variable.
-type AssignStmt struct {
-	Value  interface{}
+// NotStmt represents a negated statement.
+type NotStmt struct {
+	Block *Block
+}
+
+// AssignBooleanStmt represents an assignment of a boolean value to a local variable.
+type AssignBooleanStmt struct {
+	Value  bool
 	Target Local
+}
+
+// AssignIntStmt represents an assignment of an integer value to a
+// local variable.
+type AssignIntStmt struct {
+	Value  int64
+	Target Local
+}
+
+// AssignVarStmt represents an assignment of one local variable to another.
+type AssignVarStmt struct {
+	Source Local
+	Target Local
+}
+
+// AssignVarOnceStmt represents an assignment of one local variable to another.
+// If the target is defined, execution aborts with a conflict error.
+//
+// TODO(tsandall): is there a better name for this?
+type AssignVarOnceStmt struct {
+	Target Local
+	Source Local
 }
 
 // MakeStringStmt constructs a local variable that refers to a string constant.
 type MakeStringStmt struct {
 	Index  int
+	Target Local
+}
+
+// MakeNullStmt constructs a local variable that refers to a null value.
+type MakeNullStmt struct {
 	Target Local
 }
 
@@ -154,9 +252,32 @@ type MakeBooleanStmt struct {
 	Target Local
 }
 
+// MakeNumberFloatStmt constructs a local variable that refers to a
+// floating-point number value.
+type MakeNumberFloatStmt struct {
+	Value  float64
+	Target Local
+}
+
 // MakeNumberIntStmt constructs a local variable that refers to an integer value.
 type MakeNumberIntStmt struct {
 	Value  int64
+	Target Local
+}
+
+// MakeArrayStmt constructs a local variable that refers to an array value.
+type MakeArrayStmt struct {
+	Capacity int32
+	Target   Local
+}
+
+// MakeObjectStmt constructs a local variable that refers to an object value.
+type MakeObjectStmt struct {
+	Target Local
+}
+
+// MakeSetStmt constructs a local variable that refers to a set value.
+type MakeSetStmt struct {
 	Target Local
 }
 
@@ -194,4 +315,63 @@ type GreaterThanEqualStmt struct {
 type NotEqualStmt struct {
 	A Local
 	B Local
+}
+
+// IsArrayStmt represents a dynamic type check on a local variable.
+type IsArrayStmt struct {
+	Source Local
+}
+
+// IsObjectStmt represents a dynamic type check on a local variable.
+type IsObjectStmt struct {
+	Source Local
+}
+
+// IsDefinedStmt represents a check of whether a local variable is defined.
+type IsDefinedStmt struct {
+	Source Local
+}
+
+// IsUndefinedStmt represents a check of whether local variable is undefined.
+type IsUndefinedStmt struct {
+	Source Local
+}
+
+// ArrayAppendStmt represents a dynamic append operation of a value
+// onto an array.
+type ArrayAppendStmt struct {
+	Value Local
+	Array Local
+}
+
+// ObjectInsertStmt represents a dynamic insert operation of a
+// key/value pair into an object.
+type ObjectInsertStmt struct {
+	Key    Local
+	Value  Local
+	Object Local
+}
+
+// ObjectInsertOnceStmt represents a dynamic insert operation of a key/value
+// pair into an object. If the key already exists and the value differs,
+// execution aborts with a conflict error.
+type ObjectInsertOnceStmt struct {
+	Key    Local
+	Value  Local
+	Object Local
+}
+
+// ObjectMergeStmt performs a recursive merge of two object values. If either of
+// the locals refer to non-object values this operation will abort with a
+// conflict error. Overlapping object keys are merged recursively.
+type ObjectMergeStmt struct {
+	A      Local
+	B      Local
+	Target Local
+}
+
+// SetAddStmt represents a dynamic add operation of an element into a set.
+type SetAddStmt struct {
+	Value Local
+	Set   Local
 }

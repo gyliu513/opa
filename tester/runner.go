@@ -12,6 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-policy-agent/opa/metrics"
+
+	"github.com/open-policy-agent/opa/bundle"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/rego"
@@ -55,6 +59,7 @@ type Result struct {
 	Error    error            `json:"error,omitempty"`
 	Duration time.Duration    `json:"duration"`
 	Trace    []*topdown.Event `json:"trace,omitempty"`
+	FailedAt *ast.Expr        `json:"failed_at,omitempty"`
 }
 
 func newResult(loc *ast.Location, pkg, name string, duration time.Duration, trace []*topdown.Event) *Result {
@@ -73,7 +78,7 @@ func (r Result) Pass() bool {
 }
 
 func (r *Result) String() string {
-	return fmt.Sprintf("%v.%v: %v (%v)", r.Package, r.Name, r.outcome(), r.Duration/time.Microsecond)
+	return fmt.Sprintf("%v.%v: %v (%v)", r.Package, r.Name, r.outcome(), r.Duration)
 }
 
 func (r *Result) outcome() string {
@@ -88,15 +93,22 @@ func (r *Result) outcome() string {
 
 // Runner implements simple test discovery and execution.
 type Runner struct {
-	compiler *ast.Compiler
-	store    storage.Store
-	cover    topdown.Tracer
-	trace    bool
+	compiler    *ast.Compiler
+	store       storage.Store
+	cover       topdown.Tracer
+	trace       bool
+	runtime     *ast.Term
+	failureLine bool
+	timeout     time.Duration
+	modules     map[string]*ast.Module
+	bundles     map[string]*bundle.Bundle
 }
 
 // NewRunner returns a new runner.
 func NewRunner() *Runner {
-	return &Runner{}
+	return &Runner{
+		timeout: 5 * time.Second,
+	}
 }
 
 // SetCompiler sets the compiler used by the runner.
@@ -120,7 +132,7 @@ func (r *Runner) SetCoverageTracer(tracer topdown.Tracer) *Runner {
 	return r
 }
 
-// EnableTracing enables tracing of evaluatation and includes traces in results.
+// EnableTracing enables tracing of evaluation and includes traces in results.
 // Tracing is currently mutually exclusive with coverage.
 func (r *Runner) EnableTracing(yes bool) *Runner {
 	r.trace = yes
@@ -130,42 +142,121 @@ func (r *Runner) EnableTracing(yes bool) *Runner {
 	return r
 }
 
-// Run executes all tests contained in supplied modules.
-func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch chan *Result, err error) {
+// EnableFailureLine if set will provide the exact failure line
+func (r *Runner) EnableFailureLine(yes bool) *Runner {
+	r.failureLine = yes
+	return r
+}
 
-	// rewrite duplicate test_* rule names
-	count := map[string]int{}
-	for _, mod := range modules {
-		for _, rule := range mod.Rules {
-			name := rule.Head.Name.String()
-			if !strings.HasPrefix(name, TestPrefix) {
-				continue
-			}
-			if k, ok := count[name]; ok {
-				rule.Head.Name = ast.Var(fmt.Sprintf("%s#%02d", name, k))
-			}
-			count[name]++
+// SetRuntime sets runtime information to expose to the evaluation engine.
+func (r *Runner) SetRuntime(term *ast.Term) *Runner {
+	r.runtime = term
+	return r
+}
+
+// SetTimeout sets the timeout for the individual test cases
+func (r *Runner) SetTimeout(timout time.Duration) *Runner {
+	r.timeout = timout
+	return r
+}
+
+// SetModules will add modules to the Runner which will be compiled then used
+// for discovering and evaluating tests.
+func (r *Runner) SetModules(modules map[string]*ast.Module) *Runner {
+	r.modules = modules
+	return r
+}
+
+// SetBundles will add bundles to the Runner which will be compiled then used
+// for discovering and evaluating tests.
+func (r *Runner) SetBundles(bundles map[string]*bundle.Bundle) *Runner {
+	r.bundles = bundles
+	return r
+}
+
+func getFailedAtFromTrace(bufFailureLineTracer *topdown.BufferTracer) *ast.Expr {
+	events := *bufFailureLineTracer
+	const SecondToLast = 2
+	eventsLen := len(events)
+	for i, opFail := eventsLen-1, 0; i >= 0; i-- {
+		if events[i].Op == topdown.FailOp {
+			opFail++
+		}
+		if opFail == SecondToLast {
+			return events[i].Node.(*ast.Expr)
 		}
 	}
+	return nil
+}
 
+// Run executes all tests contained in supplied modules.
+// Deprecated: Use RunTests and the Runner#SetModules or Runner#SetBundles
+// helpers instead. This will NOT use the modules or bundles set on the Runner.
+func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch chan *Result, err error) {
+	return r.SetModules(modules).RunTests(ctx, nil)
+}
+
+// RunTests executes all tests contained in modules
+// found in either modules or bundles loaded on the runner.
+func (r *Runner) RunTests(ctx context.Context, txn storage.Transaction) (ch chan *Result, err error) {
 	if r.compiler == nil {
 		r.compiler = ast.NewCompiler()
 	}
+
+	// rewrite duplicate test_* rule names as we compile modules
+	r.compiler.WithStageAfter("ResolveRefs", ast.CompilerStageDefinition{
+		Name:       "RewriteDuplicateTestNames",
+		MetricName: "rewrite_duplicate_test_names",
+		Stage:      rewriteDuplicateTestNames,
+	})
 
 	if r.store == nil {
 		r.store = inmem.New()
 	}
 
-	filenames := make([]string, 0, len(modules))
-	for name := range modules {
+	if r.bundles != nil && len(r.bundles) > 0 {
+		if txn == nil {
+			return nil, fmt.Errorf("unable to activate bundles: storage transaction is nil")
+		}
+
+		// Activate the bundle(s) to get their info and policies into the store
+		// the actual compiled policies will overwritten later..
+		opts := &bundle.ActivateOpts{
+			Ctx:      ctx,
+			Store:    r.store,
+			Txn:      txn,
+			Compiler: r.compiler,
+			Metrics:  metrics.New(),
+			Bundles:  r.bundles,
+		}
+		err = bundle.Activate(opts)
+		if err != nil {
+			return nil, err
+		}
+
+		// Aggregate the bundle modules with other ones provided
+		if r.modules == nil {
+			r.modules = map[string]*ast.Module{}
+		}
+		for path, b := range r.bundles {
+			for name, mod := range b.ParsedModules(path) {
+				r.modules[name] = mod
+			}
+		}
+	}
+
+	if r.modules != nil && len(r.modules) > 0 {
+		if r.compiler.Compile(r.modules); r.compiler.Failed() {
+			return nil, r.compiler.Errors
+		}
+	}
+
+	filenames := make([]string, 0, len(r.compiler.Modules))
+	for name := range r.compiler.Modules {
 		filenames = append(filenames, name)
 	}
 
 	sort.Strings(filenames)
-
-	if r.compiler.Compile(modules); r.compiler.Failed() {
-		return nil, r.compiler.Errors
-	}
 
 	ch = make(chan *Result)
 
@@ -177,7 +268,11 @@ func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch ch
 				if !strings.HasPrefix(string(rule.Head.Name), TestPrefix) {
 					continue
 				}
-				tr, stop := r.runTest(ctx, module, rule)
+				tr, stop := func() (*Result, bool) {
+					runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+					defer cancel()
+					return r.runTest(runCtx, txn, module, rule)
+				}()
 				ch <- tr
 				if stop {
 					return
@@ -189,9 +284,31 @@ func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch ch
 	return ch, nil
 }
 
-func (r *Runner) runTest(ctx context.Context, mod *ast.Module, rule *ast.Rule) (*Result, bool) {
+// rewriteDuplicateTestNames will rewrite duplicate test names to have a numbered suffix.
+// This uses a global "count" of each to ensure compiling more than once as new modules
+// are added can't introduce duplicates again.
+func rewriteDuplicateTestNames(compiler *ast.Compiler) *ast.Error {
+	count := map[string]int{}
+	for _, mod := range compiler.Modules {
+		for _, rule := range mod.Rules {
+			name := rule.Head.Name.String()
+			if !strings.HasPrefix(name, TestPrefix) {
+				continue
+			}
+			key := rule.Path().String()
+			if k, ok := count[key]; ok {
+				rule.Head.Name = ast.Var(fmt.Sprintf("%s#%02d", name, k))
+			}
+			count[key]++
+		}
+	}
+	return nil
+}
+
+func (r *Runner) runTest(ctx context.Context, txn storage.Transaction, mod *ast.Module, rule *ast.Rule) (*Result, bool) {
 
 	var bufferTracer *topdown.BufferTracer
+	var bufFailureLineTracer *topdown.BufferTracer
 	var tracer topdown.Tracer
 
 	if r.cover != nil {
@@ -199,13 +316,18 @@ func (r *Runner) runTest(ctx context.Context, mod *ast.Module, rule *ast.Rule) (
 	} else if r.trace {
 		bufferTracer = topdown.NewBufferTracer()
 		tracer = bufferTracer
+	} else if r.failureLine {
+		bufFailureLineTracer = topdown.NewBufferTracer()
+		tracer = bufFailureLineTracer
 	}
 
 	rego := rego.New(
 		rego.Store(r.store),
+		rego.Transaction(txn),
 		rego.Compiler(r.compiler),
 		rego.Query(rule.Path().String()),
 		rego.Tracer(tracer),
+		rego.Runtime(r.runtime),
 	)
 
 	t0 := time.Now()
@@ -223,11 +345,14 @@ func (r *Runner) runTest(ctx context.Context, mod *ast.Module, rule *ast.Rule) (
 
 	if err != nil {
 		tr.Error = err
-		if topdown.IsCancel(err) {
+		if topdown.IsCancel(err) && !(ctx.Err() == context.DeadlineExceeded) {
 			stop = true
 		}
 	} else if len(rs) == 0 {
 		tr.Fail = true
+		if bufFailureLineTracer != nil {
+			tr.FailedAt = getFailedAtFromTrace(bufFailureLineTracer)
+		}
 	} else if b, ok := rs[0].Expressions[0].Value.(bool); !ok || !b {
 		tr.Fail = true
 	}
@@ -243,8 +368,34 @@ func Load(args []string, filter loader.Filter) (map[string]*ast.Module, storage.
 	}
 	store := inmem.NewFromObject(loaded.Documents)
 	modules := map[string]*ast.Module{}
-	for _, loadedModule := range loaded.Modules {
-		modules[loadedModule.Name] = loadedModule.Parsed
+	ctx := context.Background()
+	err = storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
+		for _, loadedModule := range loaded.Modules {
+			modules[loadedModule.Name] = loadedModule.Parsed
+
+			// Add the policies to the store to ensure that any future bundle
+			// activations will preserve them and re-compile the module with
+			// the bundle modules.
+			err := store.UpsertPolicy(ctx, txn, loadedModule.Name, loadedModule.Raw)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return modules, store, err
+}
+
+// LoadBundles will load the given args as bundles, either tarball or directory is OK.
+func LoadBundles(args []string, filter loader.Filter) (map[string]*bundle.Bundle, error) {
+	bundles := map[string]*bundle.Bundle{}
+	for _, bundleDir := range args {
+		b, err := loader.AsBundle(bundleDir)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load bundle %s: %s", bundleDir, err)
+		}
+		bundles[bundleDir] = b
 	}
-	return modules, store, nil
+
+	return bundles, nil
 }

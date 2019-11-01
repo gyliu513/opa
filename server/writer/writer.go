@@ -16,7 +16,7 @@ import (
 
 // HTTPStatus is used to set a specific status code
 // Adapted from https://stackoverflow.com/questions/27711154/what-response-code-to-return-on-a-non-supported-http-method-on-rest
-func HTTPStatus(code int) func(w http.ResponseWriter, req *http.Request) {
+func HTTPStatus(code int) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(code)
 	}
@@ -64,6 +64,7 @@ func Error(w http.ResponseWriter, status int, err *types.ErrorV1) {
 	headers := w.Header()
 	headers.Add("Content-Type", "application/json")
 	Bytes(w, status, err.Bytes())
+	w.Write([]byte("\n"))
 }
 
 // JSON writes a response with the specified status code and object. The object
@@ -86,6 +87,10 @@ func JSON(w http.ResponseWriter, code int, v interface{}, pretty bool) {
 	headers := w.Header()
 	headers.Add("Content-Type", "application/json")
 	Bytes(w, code, bs)
+
+	if pretty {
+		w.Write([]byte("\n"))
+	}
 }
 
 // Bytes writes a response with the specified status code and bytes.

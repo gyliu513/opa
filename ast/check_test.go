@@ -266,7 +266,7 @@ func TestCheckInference(t *testing.T) {
 		test.Subtest(t, tc.note, func(t *testing.T) {
 			body := MustParseBody(tc.query)
 			checker := newTypeChecker()
-			env := checker.checkLanguageBuiltins()
+			env := checker.checkLanguageBuiltins(nil, BuiltinMap)
 			env, err := checker.CheckBody(env, body)
 			if len(err) != 0 {
 				t.Fatalf("Unexpected error: %v", err)
@@ -508,7 +508,7 @@ func TestCheckErrorSuppression(t *testing.T) {
 
 	query = `_ = [true | count(1)]`
 
-	_, errs = newTypeChecker().CheckBody(newTypeChecker().checkLanguageBuiltins(), MustParseBody(query))
+	_, errs = newTypeChecker().CheckBody(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), MustParseBody(query))
 	if len(errs) != 1 {
 		t.Fatalf("Expected exactly one error but got: %v", errs)
 	}
@@ -537,7 +537,7 @@ func TestCheckBadCardinality(t *testing.T) {
 	for _, test := range tests {
 		body := MustParseBody(test.body)
 		tc := newTypeChecker()
-		env := tc.checkLanguageBuiltins()
+		env := tc.checkLanguageBuiltins(nil, BuiltinMap)
 		_, err := tc.CheckBody(env, body)
 		if len(err) != 1 || err[0].Code != TypeErr {
 			t.Fatalf("Expected 1 type error from %v but got: %v", body, err)
@@ -623,7 +623,6 @@ func TestCheckBuiltinErrors(t *testing.T) {
 		{"objects-bad-input", `sum({"a": 1, "b": 2}, x)`},
 		{"sets-any", `sum({1,2,"3",4}, x)`},
 		{"virtual-ref", `plus(data.test.p, data.deabeef, 0)`},
-		{"function-ref", `data.test.f(1, data.test.f)`},
 	}
 
 	env := newTestEnv([]string{
@@ -837,7 +836,7 @@ func TestCheckRefErrInvalid(t *testing.T) {
 	}
 }
 
-func TestUserFunctionsTypeInference(t *testing.T) {
+func TestFunctionsTypeInference(t *testing.T) {
 	functions := []string{
 		`foo([a, b]) = y { split(a, b, y) }`,
 		`bar(x) = y { count(x, y) }`,
@@ -901,6 +900,18 @@ func TestUserFunctionsTypeInference(t *testing.T) {
 			`f(x) = y { {"k": x} = y }`,
 			false,
 		},
+		{
+			`p { [data.base.foo] }`,
+			true,
+		},
+		{
+			`p { x = data.base.foo }`,
+			true,
+		},
+		{
+			`p { data.base.foo(data.base.bar) }`,
+			true,
+		},
 	}
 
 	for n, test := range tests {
@@ -914,6 +925,33 @@ func TestUserFunctionsTypeInference(t *testing.T) {
 				t.Errorf("Expected success but got error: %v", c.Errors)
 			}
 		})
+	}
+}
+
+func TestFunctionTypeInferenceUnappliedWithObjectVarKey(t *testing.T) {
+
+	// Run type inference on a function that constructs an object with a key
+	// from args in the head.
+	module := MustParseModule(`
+		package test
+
+		f(x) = y { y = {x: 1} }
+	`)
+
+	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), []util.T{
+		module.Rules[0],
+	})
+
+	if len(err) > 0 {
+		t.Fatal(err)
+	}
+
+	// Check inferrred type for reference to function.
+	tpe := env.Get(MustParseRef("data.test.f"))
+	exp := types.NewFunction([]types.Type{types.A}, types.NewObject(nil, types.NewDynamicProperty(types.A, types.N)))
+
+	if types.Compare(tpe, exp) != 0 {
+		t.Fatalf("Expected %v but got %v", exp, tpe)
 	}
 }
 
@@ -991,6 +1029,37 @@ func TestCheckErrorDetails(t *testing.T) {
 	}
 }
 
+func TestCheckErrorOrdering(t *testing.T) {
+
+	mod := MustParseModule(`
+		package test
+
+		q = true
+
+		p { data.test.q = 1 }  # type error: bool = number
+		p { data.test.q = 2 }  # type error: bool = number
+	`)
+
+	input := make([]util.T, len(mod.Rules))
+	inputReversed := make([]util.T, len(mod.Rules))
+
+	for i := range input {
+		input[i] = mod.Rules[i]
+		inputReversed[i] = mod.Rules[i]
+	}
+
+	tmp := inputReversed[1]
+	inputReversed[1] = inputReversed[2]
+	inputReversed[2] = tmp
+
+	_, errs1 := newTypeChecker().CheckTypes(nil, input)
+	_, errs2 := newTypeChecker().CheckTypes(nil, inputReversed)
+
+	if errs1.Error() != errs2.Error() {
+		t.Fatalf("Expected error slices to be equal. errs1:\n\n%v\n\nerrs2:\n\n%v\n\n", errs1, errs2)
+	}
+}
+
 func newTestEnv(rs []string) *TypeEnv {
 	module := MustParseModule(`
 		package test
@@ -1008,7 +1077,7 @@ func newTestEnv(rs []string) *TypeEnv {
 		}
 	}
 
-	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(), elems)
+	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(nil, BuiltinMap), elems)
 	if len(err) > 0 {
 		panic(err)
 	}

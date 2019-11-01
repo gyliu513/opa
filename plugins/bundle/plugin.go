@@ -7,158 +7,187 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math/rand"
-	"net/http"
+	"reflect"
 	"sync"
-	"time"
+
+	"github.com/open-policy-agent/opa/metrics"
 
 	"github.com/open-policy-agent/opa/ast"
-	"github.com/open-policy-agent/opa/bundle"
-	"github.com/open-policy-agent/opa/plugins"
-	"github.com/open-policy-agent/opa/server/types"
-	"github.com/open-policy-agent/opa/storage"
-	"github.com/open-policy-agent/opa/util"
-	"github.com/pkg/errors"
+
 	"github.com/sirupsen/logrus"
+
+	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/download"
+	"github.com/open-policy-agent/opa/plugins"
+	"github.com/open-policy-agent/opa/storage"
 )
 
-const (
-	// min amount of time to wait following a failure
-	minRetryDelay          = time.Millisecond * 100
-	defaultMinDelaySeconds = int64(60)
-	defaultMaxDelaySeconds = int64(120)
-)
-
-// PollingConfig represents configuration for the plugin's polling behaviour.
-type PollingConfig struct {
-	MinDelaySeconds *int64 `json:"min_delay_seconds,omitempty"` // min amount of time to wait between successful poll attempts
-	MaxDelaySeconds *int64 `json:"max_delay_seconds,omitempty"` // max amount of time to wait between poll attempts
-}
-
-// Config represents configuration the plguin.
-type Config struct {
-	Name    string        `json:"name"`
-	Service string        `json:"service"`
-	Polling PollingConfig `json:"polling"`
-}
-
-func (c *Config) validateAndInjectDefaults(services []string) error {
-
-	if c.Name == "" {
-		return fmt.Errorf("invalid bundle name %q", c.Name)
-	}
-
-	found := false
-
-	for _, svc := range services {
-		if svc == c.Service {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("invalid service name %q in bundle %q", c.Service, c.Name)
-	}
-
-	min := defaultMinDelaySeconds
-	max := defaultMaxDelaySeconds
-
-	// reject bad min/max values
-	if c.Polling.MaxDelaySeconds != nil && c.Polling.MinDelaySeconds != nil {
-		if *c.Polling.MaxDelaySeconds < *c.Polling.MinDelaySeconds {
-			return fmt.Errorf("max polling delay must be >= min polling delay in bundle %q", c.Name)
-		}
-		min = *c.Polling.MinDelaySeconds
-		max = *c.Polling.MaxDelaySeconds
-	} else if c.Polling.MaxDelaySeconds == nil && c.Polling.MinDelaySeconds != nil {
-		return fmt.Errorf("polling configuration missing 'max_delay_seconds' in bundle %q", c.Name)
-	} else if c.Polling.MinDelaySeconds == nil && c.Polling.MaxDelaySeconds != nil {
-		return fmt.Errorf("polling configuration missing 'min_delay_seconds' in bundle %q", c.Name)
-	}
-
-	// scale to seconds
-	minSeconds := int64(time.Duration(min) * time.Second)
-	c.Polling.MinDelaySeconds = &minSeconds
-
-	maxSeconds := int64(time.Duration(max) * time.Second)
-	c.Polling.MaxDelaySeconds = &maxSeconds
-
-	return nil
-}
-
-const (
-	errCode = "bundle_error"
-)
-
-// Status represents the status of the plugin.
-type Status struct {
-	Name                     string    `json:"name"`
-	ActiveRevision           string    `json:"active_revision,omitempty"`
-	LastSuccessfulActivation time.Time `json:"last_successful_activation,omitempty"`
-	LastSuccessfulDownload   time.Time `json:"last_successful_download,omitempty"`
-	Code                     string    `json:"code,omitempty"`
-	Message                  string    `json:"message,omitempty"`
-	Errors                   []error   `json:"errors,omitempty"`
-}
-
-// Plugin implements bundle downloading and activation.
+// Plugin implements bundle activation.
 type Plugin struct {
-	manager   *plugins.Manager             // plugin manager for storage and service clients
-	config    Config                       // plugin config
-	stop      chan chan struct{}           // used to signal plugin to stop running
-	etag      string                       // last ETag header for caching purposes
-	status    *Status                      // current plugin status
-	listeners map[interface{}]func(Status) // listeners to send status updates to
-	mtx       sync.Mutex
+	config        Config
+	manager       *plugins.Manager                         // plugin manager for storage and service clients
+	status        map[string]*Status                       // current status for each bundle
+	etags         map[string]string                        // etag on last successful activation
+	listeners     map[interface{}]func(Status)             // listeners to send status updates to
+	bulkListeners map[interface{}]func(map[string]*Status) // listeners to send aggregated status updates to
+	downloaders   map[string]*download.Downloader
+	mtx           sync.Mutex
+	cfgMtx        sync.Mutex
+	legacyConfig  bool
 }
 
 // New returns a new Plugin with the given config.
-func New(config []byte, manager *plugins.Manager) (*Plugin, error) {
-
-	var parsedConfig Config
-
-	if err := util.Unmarshal(config, &parsedConfig); err != nil {
-		return nil, err
+func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
+	initialStatus := map[string]*Status{}
+	for name := range parsedConfig.Bundles {
+		initialStatus[name] = &Status{
+			Name: name,
+		}
 	}
 
-	if err := parsedConfig.validateAndInjectDefaults(manager.Services()); err != nil {
-		return nil, err
+	p := &Plugin{
+		manager:     manager,
+		config:      *parsedConfig,
+		status:      initialStatus,
+		downloaders: make(map[string]*download.Downloader),
+		etags:       make(map[string]string),
 	}
+	p.initDownloaders()
+	return p
+}
 
-	plugin := &Plugin{
-		manager: manager,
-		config:  parsedConfig,
-		stop:    make(chan chan struct{}),
-		status: &Status{
-			Name: parsedConfig.Name,
-		},
-		listeners: map[interface{}]func(Status){},
+// Name identifies the plugin on manager.
+const Name = "bundle"
+
+// Lookup returns the bundle plugin registered with the manager.
+func Lookup(manager *plugins.Manager) *Plugin {
+	if p := manager.Plugin(Name); p != nil {
+		return p.(*Plugin)
 	}
-
-	return plugin, nil
+	return nil
 }
 
 // Start runs the plugin. The plugin will periodically try to download bundles
 // from the configured service. When a new bundle is downloaded, the data and
 // policies are extracted and inserted into storage.
 func (p *Plugin) Start(ctx context.Context) error {
-	go p.loop()
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	for name, dl := range p.downloaders {
+		p.logInfo(name, "Starting bundle downloader.")
+		dl.Start(ctx)
+	}
 	return nil
 }
 
 // Stop stops the plugin.
 func (p *Plugin) Stop(ctx context.Context) {
-	done := make(chan struct{})
-	p.stop <- done
-	_ = <-done
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	for name, dl := range p.downloaders {
+		p.logInfo(name, "Stopping bundle downloader.")
+		dl.Stop(ctx)
+	}
 }
 
-// Register a lisetner to receive status updates. The name must be comparable.
+// Reconfigure notifies the plugin that it's configuration has changed.
+// Any bundle configs that have changed or been added/removed will take
+// affect.
+func (p *Plugin) Reconfigure(ctx context.Context, config interface{}) {
+	// Reconfiguring should not occur in parallel, lock to ensure
+	// nothing swaps underneath us with the current p.config and the updated one.
+	// Use p.cfgMtx instead of p.mtx so as to not block any bundle downloads/activations
+	// that are in progress. We upgrade to p.mtx locking after stopping downloaders.
+	p.cfgMtx.Lock()
+	defer p.cfgMtx.Unlock()
+
+	// Look for any bundles that have had their config changed, are new, or have been removed
+	newConfig := config.(*Config)
+	newBundles, updatedBundles, deletedBundles := p.configDelta(newConfig)
+	p.config = *newConfig
+
+	if len(updatedBundles) == 0 && len(newBundles) == 0 && len(deletedBundles) == 0 {
+		// no relevant config changes
+		return
+	}
+
+	// Stop the downloaders outside p.mtx to allow them to finish handling any in-progress requests.
+	for name, dl := range p.downloaders {
+		_, updated := updatedBundles[name]
+		_, deleted := deletedBundles[name]
+		if updated || deleted {
+			dl.Stop(ctx)
+		}
+	}
+
+	// Only lock p.mtx once we start changing the internal maps
+	// and downloader configs.
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	// Cleanup existing downloaders that are deleted
+	for name := range p.downloaders {
+		if _, deleted := deletedBundles[name]; deleted {
+			p.logInfo(name, "Bundle downloader configuration removed. Stopping bundle downloader.")
+			delete(p.downloaders, name)
+			delete(p.status, name)
+			delete(p.etags, name)
+		}
+	}
+
+	// Deactivate the bundles that were removed
+	params := storage.WriteParams
+	params.Context = storage.NewContext()
+	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
+		opts := &bundle.DeactivateOpts{
+			Ctx:         ctx,
+			Store:       p.manager.Store,
+			Txn:         txn,
+			BundleNames: deletedBundles,
+		}
+		err := bundle.Deactivate(opts)
+		if err != nil {
+			p.logError(fmt.Sprint(deletedBundles), "Failed to deactivate bundles: %s", err)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		// TODO(patrick-east): This probably shouldn't panic.. But OPA shouldn't
+		// continue in a potentially inconsistent state.
+		panic(errors.New("Unable deactivate bundle: " + err.Error()))
+	}
+
+	for name, source := range p.config.Bundles {
+		_, updated := updatedBundles[name]
+		_, isNew := newBundles[name]
+
+		if isNew || updated {
+			if isNew {
+				p.status[name] = &Status{Name: name}
+				p.logInfo(name, "New bundle downloader configuration added. Starting bundle downloader.")
+			} else {
+				p.logInfo(name, "Bundle downloader configuration changed. Restarting bundle downloader.")
+			}
+			p.downloaders[name] = p.newDownloader(name, source)
+			p.downloaders[name].Start(ctx)
+		}
+	}
+}
+
+// Register a listener to receive status updates. The name must be comparable.
+// The listener will receive a status update for each bundle configured, they are
+// not going to be aggregated. For all status updates use `RegisterBulkListener`.
 func (p *Plugin) Register(name interface{}, listener func(Status)) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
+
+	if p.listeners == nil {
+		p.listeners = map[interface{}]func(Status){}
+	}
+
 	p.listeners[name] = listener
 }
 
@@ -166,239 +195,183 @@ func (p *Plugin) Register(name interface{}, listener func(Status)) {
 func (p *Plugin) Unregister(name interface{}) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-	delete(p.listeners, name)
+
+	delete(p.bulkListeners, name)
 }
 
-func (p *Plugin) loop() {
+// RegisterBulkListener registers a listener to receive bulk (aggregated) status updates. The name must be comparable.
+func (p *Plugin) RegisterBulkListener(name interface{}, listener func(map[string]*Status)) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	var retry int
-
-	for {
-		updated, err := p.oneShot(ctx)
-
-		if err != nil {
-			p.logError("%v.", err)
-		} else if !updated {
-			p.logDebug("Bundle download skipped, server replied with not modified.")
-		} else if p.etag != "" {
-			p.logInfo("Bundle downloaded and activated successfully. Etag updated to %v.", p.etag)
-		} else {
-			p.logInfo("Bundle downloaded and activated successfully.")
-		}
-
-		var delay time.Duration
-
-		if err == nil {
-			min := float64(*p.config.Polling.MinDelaySeconds)
-			max := float64(*p.config.Polling.MaxDelaySeconds)
-			delay = time.Duration(((max - min) * rand.Float64()) + min)
-		} else {
-			delay = util.DefaultBackoff(float64(minRetryDelay), float64(*p.config.Polling.MaxDelaySeconds), retry)
-		}
-
-		p.logDebug("Waiting %v before next download/retry.", delay)
-		timer := time.NewTimer(delay)
-
-		select {
-		case <-timer.C:
-			if err != nil {
-				retry++
-			} else {
-				retry = 0
-			}
-		case done := <-p.stop:
-			cancel()
-			done <- struct{}{}
-			return
-		}
+	if p.bulkListeners == nil {
+		p.bulkListeners = map[interface{}]func(map[string]*Status){}
 	}
 
+	p.bulkListeners[name] = listener
 }
 
-func (p *Plugin) oneShot(ctx context.Context) (updated bool, err error) {
+// UnregisterBulkListener unregisters a listener to stop receiving aggregated status updates.
+func (p *Plugin) UnregisterBulkListener(name interface{}) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
 
-	defer func() {
-		p.setErrorStatus(err)
-		status := *p.status
+	delete(p.bulkListeners, name)
+}
 
-		for _, listener := range p.listeners {
-			listener(status)
-		}
-	}()
+// Config returns the plugins current configuration
+func (p *Plugin) Config() *Config {
+	return &p.config
+}
 
-	p.logDebug("Download starting.")
-
-	resp, err := p.manager.Client(p.config.Service).
-		WithHeader("If-None-Match", p.etag).
-		Do(ctx, "GET", fmt.Sprintf("/bundles/%v", p.config.Name))
-
-	if err != nil {
-		return false, errors.Wrap(err, "Download request failed")
-	}
-
-	defer util.Close(resp)
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if err := p.process(ctx, resp); err != nil {
-			return false, err
-		}
-		return true, nil
-	case http.StatusNotModified:
-		return false, nil
-	case http.StatusNotFound:
-		return false, fmt.Errorf("Bundle download failed, server replied with not found")
-	case http.StatusUnauthorized:
-		return false, fmt.Errorf("Bundle download failed, server replied with not authorized")
-	default:
-		return false, fmt.Errorf("Bundle download failed, server replied with HTTP %v", resp.StatusCode)
+func (p *Plugin) initDownloaders() {
+	// Initialize a downloader for each bundle configured.
+	for name, source := range p.config.Bundles {
+		p.downloaders[name] = p.newDownloader(name, source)
 	}
 }
 
-func (p *Plugin) process(ctx context.Context, resp *http.Response) error {
-
-	b, err := p.download(ctx, resp)
-	if err != nil {
-		return errors.Wrap(err, "Bundle download failed")
-	}
-
-	if err := p.activate(ctx, resp.Header.Get("ETag"), *b); err != nil {
-		return errors.Wrap(err, "Bundle activation failed")
-	}
-
-	return nil
-}
-
-func (p *Plugin) download(ctx context.Context, resp *http.Response) (*bundle.Bundle, error) {
-
-	p.logDebug("Bundle download in progress.")
-
-	b, err := bundle.Read(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	p.status.LastSuccessfulDownload = time.Now().UTC()
-	return &b, nil
-}
-
-func (p *Plugin) activate(ctx context.Context, etag string, b bundle.Bundle) error {
-	p.logDebug("Bundle activation in progress. Opening storage transaction.")
-
-	return storage.Txn(ctx, p.manager.Store, storage.WriteParams, func(txn storage.Transaction) error {
-		p.logDebug("Opened storage transaction (%v).", txn.ID())
-		defer p.logDebug("Closing storage transaction (%v).", txn.ID())
-
-		// write data from bundle into store, overwritting contents
-		if err := p.manager.Store.Write(ctx, txn, storage.AddOp, storage.Path{}, b.Data); err != nil {
-			return err
-		}
-
-		if err := p.writeManifest(ctx, txn, b.Manifest); err != nil {
-			return err
-		}
-
-		// load existing policy ids from store and delete
-		ids, err := p.manager.Store.ListPolicies(ctx, txn)
-		if err != nil {
-			return err
-		}
-
-		for _, id := range ids {
-			if err := p.manager.Store.DeletePolicy(ctx, txn, id); err != nil {
-				return err
-			}
-		}
-
-		// ensure that policies compile.
-		modules := map[string]*ast.Module{}
-
-		for _, file := range b.Modules {
-			modules[file.Path] = file.Parsed
-		}
-
-		compiler := ast.NewCompiler()
-		if compiler.Compile(modules); compiler.Failed() {
-			return compiler.Errors
-		}
-
-		// write policies from bundle into store.
-		for _, file := range b.Modules {
-			if err := p.manager.Store.UpsertPolicy(ctx, txn, file.Path, file.Raw); err != nil {
-				return err
-			}
-		}
-
-		p.status.LastSuccessfulActivation = time.Now().UTC()
-		p.status.ActiveRevision = b.Manifest.Revision
-		p.etag = etag
-
-		return nil
+func (p *Plugin) newDownloader(name string, source *Source) *download.Downloader {
+	conf := source.Config
+	client := p.manager.Client(source.Service)
+	path := source.Resource
+	return download.New(conf, client, path).WithCallback(func(ctx context.Context, u download.Update) {
+		// wrap the callback to include the name of the bundle that was updated
+		p.oneShot(ctx, name, u)
 	})
 }
 
-func (p *Plugin) logError(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Errorf(fmt, a...)
-}
+func (p *Plugin) oneShot(ctx context.Context, name string, u download.Update) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
 
-func (p *Plugin) logInfo(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Infof(fmt, a...)
-}
+	p.process(ctx, name, u)
 
-func (p *Plugin) logDebug(fmt string, a ...interface{}) {
-	logrus.WithFields(p.logrusFields()).Debugf(fmt, a...)
-}
+	for _, listener := range p.listeners {
+		listener(*p.status[name])
+	}
 
-func (p *Plugin) logrusFields() logrus.Fields {
-	return logrus.Fields{
-		"plugin": "bundle",
-		"name":   p.config.Name,
+	for _, listener := range p.bulkListeners {
+		listener(p.status)
 	}
 }
 
-func (p *Plugin) setErrorStatus(err error) {
+func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
 
-	if err == nil {
-		p.status.Code = ""
-		p.status.Message = ""
-		p.status.Errors = nil
+	if u.Error != nil {
+		p.logError(name, "Bundle download failed: %v", u.Error)
+		p.status[name].SetError(u.Error)
 		return
 	}
 
-	cause := errors.Cause(err)
+	if u.Bundle != nil {
+		p.status[name].SetDownloadSuccess()
 
-	if astErr, ok := cause.(ast.Errors); ok {
-		p.status.Code = errCode
-		p.status.Message = types.MsgCompileModuleError
-		p.status.Errors = make([]error, len(astErr))
-		for i := range astErr {
-			p.status.Errors[i] = astErr[i]
+		if err := p.activate(ctx, name, u.Bundle); err != nil {
+			p.logError(name, "Bundle activation failed: %v", err)
+			p.status[name].SetError(err)
+			return
 		}
-	} else {
-		p.status.Code = errCode
-		p.status.Message = err.Error()
-		p.status.Errors = nil
+
+		p.status[name].SetError(nil)
+		p.status[name].SetActivateSuccess(u.Bundle.Manifest.Revision)
+		if u.ETag != "" {
+			p.logInfo(name, "Bundle downloaded and activated successfully. Etag updated to %v.", u.ETag)
+		} else {
+			p.logInfo(name, "Bundle downloaded and activated successfully.")
+		}
+		p.etags[name] = u.ETag
+		return
+	}
+
+	if etag, ok := p.etags[name]; ok && u.ETag == etag {
+		p.logDebug(name, "Bundle download skipped, server replied with not modified.")
+		p.status[name].SetError(nil)
+		return
 	}
 }
 
-func (p *Plugin) writeManifest(ctx context.Context, txn storage.Transaction, m bundle.Manifest) error {
+func (p *Plugin) activate(ctx context.Context, name string, b *bundle.Bundle) error {
+	p.logDebug(name, "Bundle activation in progress. Opening storage transaction.")
 
-	var value interface{} = m
+	params := storage.WriteParams
+	params.Context = storage.NewContext()
 
-	if err := util.RoundTrip(&value); err != nil {
-		return err
-	}
+	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
+		p.logDebug(name, "Opened storage transaction (%v).", txn.ID())
+		defer p.logDebug(name, "Closing storage transaction (%v).", txn.ID())
 
-	if err := storage.MakeDir(ctx, p.manager.Store, txn, bundlePath); err != nil {
-		return err
-	}
+		// Compile the bundle modules with a new compiler and set it on the
+		// transaction params for use by onCommit hooks.
+		compiler := ast.NewCompiler().WithPathConflictsCheck(storage.NonEmpty(ctx, p.manager.Store, txn))
 
-	return p.manager.Store.Write(ctx, txn, storage.AddOp, manifestPath, value)
+		var activateErr error
+		m := metrics.New()
+
+		opts := &bundle.ActivateOpts{
+			Ctx:      ctx,
+			Store:    p.manager.Store,
+			Txn:      txn,
+			Compiler: compiler,
+			Metrics:  m,
+			Bundles:  map[string]*bundle.Bundle{name: b},
+		}
+
+		if p.config.IsMultiBundle() {
+			activateErr = bundle.Activate(opts)
+		} else {
+			activateErr = bundle.ActivateLegacy(opts)
+		}
+
+		plugins.SetCompilerOnContext(params.Context, compiler)
+
+		return activateErr
+	})
+
+	return err
 }
 
-var (
-	bundlePath   = storage.MustParsePath("/system/bundle")
-	manifestPath = storage.MustParsePath("/system/bundle/manifest")
-)
+func (p *Plugin) logError(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Errorf(fmt, a...)
+}
+
+func (p *Plugin) logInfo(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Infof(fmt, a...)
+}
+
+func (p *Plugin) logDebug(bundleName string, fmt string, a ...interface{}) {
+	logrus.WithFields(p.logrusFields(bundleName)).Debugf(fmt, a...)
+}
+
+func (p *Plugin) logrusFields(bundleName string) logrus.Fields {
+
+	f := logrus.Fields{
+		"plugin": Name,
+		"name":   bundleName,
+	}
+
+	return f
+}
+
+// configDelta will return a map of new bundle sources, updated bundle sources, and a set of deleted bundle names
+func (p *Plugin) configDelta(newConfig *Config) (map[string]*Source, map[string]*Source, map[string]struct{}) {
+	deletedBundles := map[string]struct{}{}
+	for name := range p.config.Bundles {
+		deletedBundles[name] = struct{}{}
+	}
+	newBundles := map[string]*Source{}
+	updatedBundles := map[string]*Source{}
+	for name, source := range newConfig.Bundles {
+		oldSource, found := p.config.Bundles[name]
+		if !found {
+			newBundles[name] = source
+		} else {
+			delete(deletedBundles, name)
+			if !reflect.DeepEqual(oldSource, source) {
+				updatedBundles[name] = source
+			}
+		}
+	}
+
+	return newBundles, updatedBundles, deletedBundles
+}

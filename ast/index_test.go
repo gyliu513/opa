@@ -125,6 +125,20 @@ func TestBaseDocEqIndexing(t *testing.T) {
 	} {
 		input.x = 0
 	}
+
+	glob_match {
+		x = input.x
+		glob.match("foo:*:bar", [":"], x)
+	} {
+		x = input.x
+		glob.match("foo:*:baz", [":"], x)
+	} {
+		x = input.x
+		glob.match("foo:*:*", [":"], x)
+	} {
+		x = input.x
+		glob.match("dead:*:beef", [":"], x)
+	}
 	`)
 
 	tests := []struct {
@@ -316,6 +330,26 @@ func TestBaseDocEqIndexing(t *testing.T) {
 				input.z = 1
 			}`))),
 		},
+		{
+			note:    "glob.match",
+			ruleset: "glob_match",
+			input:   `{"x": "foo:1234:bar"}`,
+			expectedRS: []string{`
+			glob_match {
+				x = input.x
+				glob.match("foo:*:bar", [":"], x)
+			}`, `
+			glob_match {
+				x = input.x
+				glob.match("foo:*:*", [":"], x)
+			}`},
+		},
+		{
+			note:       "glob.match unexpected value type",
+			ruleset:    "glob_match",
+			input:      `{"x": [0]}`,
+			expectedRS: []string{},
+		},
 	}
 
 	for _, tc := range tests {
@@ -475,5 +509,107 @@ func TestBaseDocEqIndexingErrors(t *testing.T) {
 	index = newBaseDocEqIndex(func(Ref) bool { return true })
 	if index.Build(nil) {
 		t.Fatalf("Expected index build to fail")
+	}
+}
+
+func TestSplitStringEscaped(t *testing.T) {
+	tests := []struct {
+		input  string
+		delims string
+		exp    []string
+	}{
+		{
+			input:  "foo:bar:baz",
+			delims: ":",
+			exp:    []string{"foo", "bar", "baz"},
+		},
+		{
+			input:  ":foo:",
+			delims: ":",
+			exp:    []string{"", "foo", ""},
+		},
+		{
+			input:  `foo\:bar`,
+			delims: ":",
+			exp:    []string{`foo\:bar`},
+		},
+		{
+			input:  "foo::bar",
+			delims: ":",
+			exp:    []string{"foo", "", "bar"},
+		},
+		{
+			input:  "foo:bar.baz",
+			delims: ":.",
+			exp:    []string{"foo", "bar", "baz"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			result := splitStringEscaped(tc.input, tc.delims)
+			if len(result) != len(tc.exp) {
+				t.Fatalf("Expected %v but got %v", tc.exp, result)
+			}
+			for i := range result {
+				if result[i] != tc.exp[i] {
+					t.Fatalf("Expected %v in pos %v but got %v", tc.exp[i], i, result[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGetAllRules(t *testing.T) {
+	module := MustParseModule(`
+	package test
+	
+	default p = 42
+	
+	p {
+		input.x = "x1"
+		input.y = "y1"
+	} else {
+		true
+	} else {
+		input.z = "z1"
+	}
+
+	p {
+		input.z = "z1"      
+	}
+	`)
+
+	index := newBaseDocEqIndex(func(Ref) bool { return false })
+
+	ok := index.Build(module.Rules)
+	if !ok {
+		t.Fatalf("Expected index build to succeed")
+	}
+
+	result, err := index.AllRules(testResolver{input: MustParseTerm(`{}`)})
+	if err != nil {
+		t.Fatalf("Unexpected error during index lookup: %v", err)
+	}
+
+	expectedRules := NewRuleSet(
+		module.Rules[1],
+		module.Rules[2])
+
+	expectedElse := map[*Rule]RuleSet{
+		module.Rules[1]: []*Rule{
+			module.Rules[1].Else,
+			module.Rules[1].Else.Else,
+		},
+	}
+
+	if !NewRuleSet(result.Rules...).Equal(expectedRules) {
+		t.Fatalf("Expected rules to be %v but got: %v", expectedRules, result.Rules)
+	}
+
+	r1 := module.Rules[1]
+
+	if !NewRuleSet(result.Else[r1]...).Equal(expectedElse[r1]) {
+		t.Fatalf("Expected else to be %v but got: %v", result.Else[r1], expectedElse[r1])
 	}
 }

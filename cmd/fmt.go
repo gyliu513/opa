@@ -13,9 +13,10 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/open-policy-agent/opa/format"
-
 	"github.com/spf13/cobra"
+
+	"github.com/open-policy-agent/opa/format"
+	fileurl "github.com/open-policy-agent/opa/internal/file/url"
 )
 
 var fmtParams = struct {
@@ -25,11 +26,12 @@ var fmtParams = struct {
 }{}
 
 var formatCommand = &cobra.Command{
-	Use:   "fmt",
+	Use:   "fmt [path [...]]",
 	Short: "Format Rego source files",
 	Long: `Format Rego source files.
 
-The 'fmt' command takes a Rego source file and outputs a reformatted version.
+The 'fmt' command takes a Rego source file and outputs a reformatted version. If no file path
+is provided - this tool will use stdin.
 The format of the output is not defined specifically; whatever this tool outputs
 is considered correct format (with the exception of bugs).
 
@@ -39,7 +41,7 @@ instead of printing to stdout.
 If the '-d' option is supplied, the 'fmt' command will output a diff between the
 original and formatted source.
 
-If the '-l' option is suppled, the 'fmt' command will output the names of files
+If the '-l' option is supplied, the 'fmt' command will output the names of files
 that would change if formatted. The '-l' option will suppress any other output
 to stdout from the 'fmt' command.`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -58,6 +60,14 @@ func opaFmt(args []string) int {
 	}
 
 	for _, filename := range args {
+
+		var err error
+		filename, err = fileurl.Clean(filename)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+
 		if err := filepath.Walk(filename, formatFile); err != nil {
 			switch err := err.(type) {
 			case fmtError:

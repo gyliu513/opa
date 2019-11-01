@@ -12,6 +12,7 @@ package ast
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -150,26 +151,59 @@ func ParseRuleFromExpr(module *Module, expr *Expr) (*Rule, error) {
 		}
 	}
 
-	if !expr.IsEquality() && expr.IsCall() {
-		if _, ok := BuiltinMap[expr.Operator().String()]; ok {
-			return nil, fmt.Errorf("rule name conflicts with built-in function")
+	if expr.IsAssignment() {
+
+		lhs, rhs := expr.Operand(0), expr.Operand(1)
+		rule, err := ParseCompleteDocRuleFromAssignmentExpr(module, lhs, rhs)
+
+		if err == nil {
+			return rule, nil
+		} else if _, ok := lhs.Value.(Call); ok {
+			return nil, errFunctionAssignOperator
+		} else if _, ok := lhs.Value.(Ref); ok {
+			return nil, errPartialRuleAssignOperator
 		}
-		return ParseRuleFromCallExpr(module, expr.Terms.([]*Term))
+
+		return nil, errTermAssignOperator(lhs.Value)
 	}
 
-	lhs, rhs := expr.Operand(0), expr.Operand(1)
+	if expr.IsEquality() {
+
+		lhs, rhs := expr.Operand(0), expr.Operand(1)
+		rule, err := ParseCompleteDocRuleFromEqExpr(module, lhs, rhs)
+
+		if err == nil {
+			return rule, nil
+		}
+
+		rule, err = ParseRuleFromCallEqExpr(module, lhs, rhs)
+		if err == nil {
+			return rule, nil
+		}
+
+		return ParsePartialObjectDocRuleFromEqExpr(module, lhs, rhs)
+	}
+
+	if _, ok := BuiltinMap[expr.Operator().String()]; ok {
+		return nil, fmt.Errorf("rule name conflicts with built-in function")
+	}
+
+	return ParseRuleFromCallExpr(module, expr.Terms.([]*Term))
+}
+
+// ParseCompleteDocRuleFromAssignmentExpr returns a rule if the expression can
+// be interpreted as a complete document definition declared with the assignment
+// operator.
+func ParseCompleteDocRuleFromAssignmentExpr(module *Module, lhs, rhs *Term) (*Rule, error) {
 
 	rule, err := ParseCompleteDocRuleFromEqExpr(module, lhs, rhs)
-	if err == nil {
-		return rule, nil
+	if err != nil {
+		return nil, err
 	}
 
-	rule, err = ParseRuleFromCallEqExpr(module, lhs, rhs)
-	if err == nil {
-		return rule, nil
-	}
+	rule.Head.Assign = true
 
-	return ParsePartialObjectDocRuleFromEqExpr(module, lhs, rhs)
+	return rule, nil
 }
 
 // ParseCompleteDocRuleFromEqExpr returns a rule if the expression can be
@@ -456,7 +490,30 @@ func ParseStatement(input string) (Statement, error) {
 // CommentsOption returns a parser option to initialize the comments store within
 // the parser.
 func CommentsOption() Option {
-	return GlobalStore(commentsKey, []*Comment{})
+	return GlobalStore(commentsKey, map[commentKey]*Comment{})
+}
+
+type commentKey struct {
+	File string
+	Row  int
+	Col  int
+}
+
+func (a commentKey) Compare(other commentKey) int {
+	if a.File < other.File {
+		return -1
+	} else if a.File > other.File {
+		return 1
+	} else if a.Row < other.Row {
+		return -1
+	} else if a.Row > other.Row {
+		return 1
+	} else if a.Col < other.Col {
+		return -1
+	} else if a.Col > other.Col {
+		return 1
+	}
+	return 0
 }
 
 // ParseStatements returns a slice of parsed statements.
@@ -474,7 +531,17 @@ func ParseStatements(filename, input string) ([]Statement, []*Comment, error) {
 	var sl []interface{}
 	if p, ok := parsed.(program); ok {
 		sl = p.buf
-		comments = p.comments.([]*Comment)
+		commentMap := p.comments.(map[commentKey]*Comment)
+		commentKeys := []commentKey{}
+		for k := range commentMap {
+			commentKeys = append(commentKeys, k)
+		}
+		sort.Slice(commentKeys, func(i, j int) bool {
+			return commentKeys[i].Compare(commentKeys[j]) < 0
+		})
+		for _, k := range commentKeys {
+			comments = append(comments, commentMap[k])
+		}
 	} else {
 		sl = parsed.([]interface{})
 	}
@@ -696,12 +763,13 @@ func (vt *varToRefTransformer) Transform(x interface{}) (interface{}, error) {
 	return x, nil
 }
 
-type parserErrorDetail struct {
-	line string
-	idx  int
+// ParserErrorDetail holds additional details for parser errors.
+type ParserErrorDetail struct {
+	Line string `json:"line"`
+	Idx  int    `json:"idx"`
 }
 
-func newParserErrorDetail(bs []byte, pos position) *parserErrorDetail {
+func newParserErrorDetail(bs []byte, pos position) *ParserErrorDetail {
 
 	offset := pos.offset
 
@@ -742,14 +810,17 @@ func newParserErrorDetail(bs []byte, pos position) *parserErrorDetail {
 	line := bs[begin:end]
 	index := offset - begin
 
-	return &parserErrorDetail{
-		line: string(line),
-		idx:  index,
+	return &ParserErrorDetail{
+		Line: string(line),
+		Idx:  index,
 	}
 }
 
-func (d parserErrorDetail) Lines() []string {
-	return []string{d.line, strings.Repeat(" ", d.idx) + "^"}
+// Lines returns the pretty formatted line output for the error details.
+func (d ParserErrorDetail) Lines() []string {
+	line := strings.TrimLeft(d.Line, "\t") // remove leading tabs
+	tabCount := len(d.Line) - len(line)
+	return []string{line, strings.Repeat(" ", d.Idx-tabCount) + "^"}
 }
 
 func isNewLineChar(b byte) bool {

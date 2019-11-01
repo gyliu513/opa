@@ -9,7 +9,9 @@ Versioning involves maintaining the following files:
 
 - **CHANGELOG.md** - this file contains a list of all the important changes in each release.
 - **Makefile** - the Makefile contains a VERSION variable that defines the version of the project.
-- **docs/*** - there are a few files in the documentation that contain hardcoded versions.
+- **docs/website/RELEASES*** - this file determines which versions of documentation are displayed
+  in the public [documentation](https://openpolicyagent.org/docs). __The first entry on the list is
+  considered to be the latest.__
 
 The steps below explain how to update these files. In addition, the repository
 should be tagged with the semantic version identifying the release.
@@ -103,11 +105,70 @@ CHANGELOG.md snippet and uploading the binaries from the build phase.
 	- Copy the changelog content into the message.
 	- Upload the binaries.
 
-1. There may be documentation updates that should be released. See
-   [docs/README.md](../README.md) for steps to update the website.
 
 ## Notes
 
 - The openpolicyagent/opa Docker image is automatically built and published to
   Docker Hub as part of the Travis-CI pipeline. There are no manual steps
   involved here.
+- The docs and website should update and be published automatically. If they are not you can
+  trigger one by a couple of methods:
+	- Login to Netlify (requires permission for the project) and manually trigger a build.
+	- Post to the build webhook via:
+		```bash
+		curl -X POST -d {} https://api.netlify.com/build_hooks/5cc3aa86495f22c7a368f1d2
+		```
+
+# Bugfix Release Process
+
+If this is the first bugfix for the release, create the release branch from the
+release tag:
+
+```bash
+git checkout -b release-0.14 v0.14.0
+```
+
+Otherwise, checkout the release branch and rebase on upstream:
+
+```bash
+git fetch upstream
+git checkout release-0.14
+git rebase upstream/release-0.14
+```
+
+Cherry pick the changes from master or other branches onto the bugfix branch:
+
+```bash
+git cherry-pick -x <commit-id>
+```
+
+Update the `VERSION` variable in the Makefile (e.g., edit and set to `0.14.1`).
+Commit this change:
+
+```bash
+git commit -s -a -m 'Prepare v0.14.1 release'
+```
+
+Push the release branch to your fork and open a Pull Request against the
+upstream release branch. Be careful to open the Pull Request against the correct
+upstream release branch. **DO NOT** open/merge the Pull Request into master or
+other release branches:
+
+```bash
+git push origin release-0.14
+```
+
+Once the Pull Request has been merged you can tag the release at the commit
+created above. Once the tag is pushed to `open-policy-agent/opa`, CI jobs will
+automatically build and publish the Docker images and website updates.
+
+The last step is to build the release binaries and publish them to the [GitHub
+releases](https://github.com/open-policy-agent/opa/releases) page along with
+updating the CHANGELOG.md file on master.
+
+```
+make release VERSION=0.14.1
+```
+
+> The release binaries are located under `_release/<version>` in your working
+> copy.

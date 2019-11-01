@@ -1,7 +1,9 @@
+const assert = require('assert');
+
 const { readFileSync, readdirSync } = require('fs');
 
 function stringDecoder(mem) {
-    return function(addr) {
+    return function (addr) {
         const i8 = new Int8Array(mem.buffer);
         const start = addr;
         var s = "";
@@ -24,17 +26,24 @@ function yellow(text) {
     return '\x1b[0m\x1b[33m' + text + '\x1b[0m';
 }
 
-function report(passed, error, msg) {
-    if (passed === true) {
+const PASS = 'PASS';
+const FAIL = 'FAIL';
+const ERROR = 'ERROR';
+
+function report(state, name, msg, extra) {
+    if (state === PASS) {
         if (process.env.VERBOSE === '1') {
-            console.log(green('PASS'), msg);
+            console.log(green('PASS'), name);
             return true;
         }
         return false;
-    } else if (error === undefined) {
-        console.log(yellow('FAIL'), msg);
+    } else if (state === FAIL) {
+        console.log(yellow('FAIL'), name + ':', msg);
     } else {
-        console.log(red('ERROR'), msg, error);
+        console.log(red('ERROR'), name + ':', msg);
+    }
+    if (extra !== '') {
+        console.log(extra);
     }
     return true
 }
@@ -47,27 +56,77 @@ function now() {
 function formatMicros(us) {
     if (us <= 1000) {
         return us + 'µs'
-    } else if (us <= 1000*1000) {
+    } else if (us <= 1000 * 1000) {
         return (us / 1000).toFixed(4) + 'ms'
     } else {
-        return (us / (1000*1000)).toFixed(4) + 's'
+        return (us / (1000 * 1000)).toFixed(4) + 's'
     }
 }
 
-function evaluate(mem, policy, input) {
+function loadJSON(mod, memory, value) {
 
-    const str = JSON.stringify(input)
-    const addr = policy.instance.exports.opa_malloc(str.length);
-    const buf = new Uint8Array(mem.buffer);
+    const str = JSON.stringify(value);
+    const rawAddr = mod.instance.exports.opa_malloc(str.length);
+    const buf = new Uint8Array(memory.buffer);
 
-    for(let i = 0; i < str.length; i++) {
-        buf[addr+i] = str.charCodeAt(i);
+    for (let i = 0; i < str.length; i++) {
+        buf[rawAddr + i] = str.charCodeAt(i);
     }
 
+    const parsedAddr = mod.instance.exports.opa_json_parse(rawAddr, str.length);
 
-    const returnCode = policy.instance.exports.eval(addr, str.length);
+    if (parsedAddr == 0) {
+        throw "failed to parse json value"
+    }
 
-    return {returnCode: returnCode};
+    return parsedAddr;
+}
+
+async function instantiate(bytes, memory, data) {
+
+    const addr2string = stringDecoder(memory);
+
+    const mod = await WebAssembly.instantiate(bytes, {
+        env: {
+            memory: memory,
+            opa_abort: function (addr) {
+                throw { message: addr2string(addr) };
+            },
+            opa_println: function (addr) {
+                console.log(addr2string(addr));
+            },
+        },
+    });
+
+    const dataAddr = loadJSON(mod, memory, data || {});
+    const heapPtr = mod.instance.exports.opa_heap_ptr_get();
+    const heapTop = mod.instance.exports.opa_heap_top_get();
+
+    return { module: mod, memory: memory, heapPtr: heapPtr, heapTop: heapTop, dataAddr: dataAddr };
+}
+
+function evaluate(policy, input) {
+    policy.module.instance.exports.opa_heap_ptr_set(policy.heapPtr);
+    policy.module.instance.exports.opa_heap_top_set(policy.heapTop);
+    const inputAddr = loadJSON(policy.module, policy.memory, input);
+    const resultAddr = policy.module.instance.exports.eval(inputAddr, policy.dataAddr);
+    return { addr: resultAddr };
+}
+
+function decodeResultSet(policy, result) {
+
+    const rawAddr = policy.module.instance.exports.opa_json_dump(result.addr);
+    const buf = new Uint8Array(policy.memory.buffer);
+
+    // NOTE(tsandall): There must be a better way of doing this...
+    let s = '';
+    let idx = rawAddr;
+
+    while (buf[idx] != 0) {
+        s += String.fromCharCode(buf[idx++]);
+    }
+
+    return JSON.parse(s);
 }
 
 function namespace(cache, key) {
@@ -82,11 +141,8 @@ function namespace(cache, key) {
 
 async function test() {
 
-    const mem = new WebAssembly.Memory({initial: 5});
-    const addr2string = stringDecoder(mem);
-
+    const memory = new WebAssembly.Memory({ initial: 5 });
     const t0 = now();
-
     var testCases = [];
     const files = readdirSync('.');
     let numFiles = 0;
@@ -95,10 +151,13 @@ async function test() {
         if (file.endsWith('.json')) {
             numFiles++;
             const testFile = JSON.parse(readFileSync(file));
-            testFile.cases.forEach(testCase => {
-                testCase.wasmBytes = Buffer.from(testCase.wasm, 'base64');
-                testCases.push(testCase);
-            });
+            if (Array.isArray(testFile.cases)) {
+                testFile.cases.forEach(testCase => {
+                    testCase.note = file + ': ' + testCase.note;
+                    testCase.wasmBytes = Buffer.from(testCase.wasm, 'base64');
+                    testCases.push(testCase);
+                });
+            }
         }
     })
 
@@ -113,44 +172,82 @@ async function test() {
     let dirty = false;
     let cache = {};
 
-    for(let i = 0; i < testCases.length; i++) {
+    for (let i = 0; i < testCases.length; i++) {
 
-        const policy = await WebAssembly.instantiate(testCases[i].wasmBytes, {
-            env: {
-                memory: mem,
-                opa_abort: function(addr) {
-                    throw addr2string(addr);
-                },
-            },
-        });
-
-        let passed = false;
-        let error = undefined;
+        let state = 'FAIL';
+        let name = namespace(cache, testCases[i].note);
+        let msg = '';
+        let extra = '';
 
         try {
-            const result = evaluate(mem, policy, testCases[i].input);
-            passed = result.returnCode === testCases[i].return_code;
-        } catch(e) {
-            passed = false;
-            error = e;
+            const policy = await instantiate(testCases[i].wasmBytes, memory, testCases[i].data);
+            const result = evaluate(policy, testCases[i].input);
+
+            const expDefined = testCases[i].want_defined;
+
+            if (expDefined !== undefined) {
+                const len = policy.module.instance.exports.opa_value_length(result.addr);
+                if (expDefined) {
+                    if (len > 0) {
+                        state = PASS;
+                    } else {
+                        msg = 'expected non-empty/defined result';
+                    }
+                } else {
+                    if (len == 0) {
+                        state = PASS;
+                    } else {
+                        msg = 'expected empty/undefined result';
+                    }
+                }
+            }
+
+            const expResultSet = testCases[i].want_result;
+
+            if (expResultSet !== undefined) {
+
+                const rs = decodeResultSet(policy, result);
+
+                try {
+                    assert.deepStrictEqual(rs, expResultSet, 'unexpected result set');
+                    state = PASS;
+                } catch (e) {
+                    msg = 'unexpected result';
+                    extra = '\twant: ' + JSON.stringify(expResultSet) + '\n\tgot : ' + JSON.stringify(rs);
+                }
+            }
+
+        } catch (e) {
+            const exp = testCases[i].want_error;
+            if (exp !== undefined && exp.length !== 0) {
+                if (e.message.includes(exp)) {
+                    state = PASS;
+                } else {
+                    state = ERROR;
+                    msg = 'want: ' + yellow(exp) + ' but got: ' + red(e.message);
+                }
+            } else {
+                state = ERROR;
+                msg = e;
+            }
         }
 
-        if (passed) {
+        if (state == PASS) {
             numPassed++;
-        } else if (error === undefined) {
+        } else if (state === FAIL) {
             numFailed++;
         } else {
             numErrors++;
         }
 
-        dirty = report(passed, error, namespace(cache, testCases[i].note)) || dirty;
+        dirty = report(state, name, msg, extra) || dirty;
     }
 
     const t_end = now();
     const dt_end = t_end - t_load;
 
     if (dirty) {
-      console.log();
+        console.log();
     }
 
     console.log('SUMMARY:');
@@ -168,7 +265,7 @@ async function test() {
     console.log();
     console.log('TOOK:', formatMicros(dt_end));
 
-    if ((numFailed+numErrors) > 0) {
+    if ((numFailed + numErrors) > 0) {
         process.exit(1);
     }
 }
